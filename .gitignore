@@ -1,0 +1,6 @@
+# Build artifacts
+*.o
+claude-c
+
+# Claude Code local settings
+.claude/

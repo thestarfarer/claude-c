@@ -14,6 +14,7 @@
 #include "api.h"
 #include "json.h"
 #include "image.h"
+#include "oauth.h"
 
 #define VERSION "1.2.0"
 #define MAX_IMAGES 16
@@ -28,6 +29,7 @@ static struct option long_options[] = {
     {"image",         required_argument, 0, 'i'},
     {"request",       required_argument, 0, 'r'},
     {"json-output",   no_argument,       0, 'J'},
+    {"login",         no_argument,       0, 'L'},
     {"help",          no_argument,       0, 'h'},
     {"version",       no_argument,       0, 'v'},
     {0, 0, 0, 0}
@@ -49,6 +51,7 @@ static void print_usage(const char* prog) {
         "  -t, --max-tokens N       Max output tokens (default: %d)\n"
         "  -r, --request FILE       Full request body JSON file (@file.json)\n"
         "  -J, --json-output        Output raw API response JSON\n"
+        "  -L, --login              Authenticate with Claude (OAuth)\n"
         "  -h, --help               Show this help\n"
         "  -v, --version            Show version\n"
         "\n"
@@ -87,9 +90,9 @@ static void print_usage(const char* prog) {
         "Supported image formats: PNG, JPEG, GIF, WEBP (max ~3.7 MB)\n"
         "\n"
         "Authentication:\n"
-        "  Set ANTHROPIC_API_KEY or use OAuth from ~/.claude/.credentials.json\n"
+        "  Run '%s --login' to authenticate, or set ANTHROPIC_API_KEY\n"
         "\n",
-        prog, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, prog, prog, prog, prog, prog, prog, prog
+        prog, DEFAULT_MODEL, DEFAULT_MAX_TOKENS, prog, prog, prog, prog, prog, prog, prog, prog
     );
 }
 
@@ -266,7 +269,7 @@ int main(int argc, char** argv) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "pSs:m:M:t:i:r:Jhv", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "pSs:m:M:t:i:r:JLhv", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'p':
                 print_mode = 1;
@@ -313,6 +316,13 @@ int main(int argc, char** argv) {
             case 'J':
                 json_output = 1;
                 break;
+            case 'L':
+                curl_global_init(CURL_GLOBAL_DEFAULT);
+                {
+                    int result = oauth_login();
+                    curl_global_cleanup();
+                    return result;
+                }
             case 'h':
                 print_usage(argv[0]);
                 return 0;

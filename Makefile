@@ -24,10 +24,19 @@ ifeq ($(CURL_LDFLAGS),)
     endif
 endif
 
-CFLAGS = $(BASE_CFLAGS) $(CURL_CFLAGS)
-LDFLAGS = $(BASE_LDFLAGS) $(CURL_LDFLAGS)
+# Auto-detect OpenSSL using pkg-config
+OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LDFLAGS := $(shell pkg-config --libs openssl 2>/dev/null)
 
-SRCS = main.c api.c auth.c stream.c json.c state.c image.c
+# Fallback if pkg-config not available
+ifeq ($(OPENSSL_LDFLAGS),)
+    OPENSSL_LDFLAGS = -lssl -lcrypto
+endif
+
+CFLAGS = $(BASE_CFLAGS) $(CURL_CFLAGS) $(OPENSSL_CFLAGS)
+LDFLAGS = $(BASE_LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
+
+SRCS = main.c api.c auth.c oauth.c stream.c json.c state.c image.c
 OBJS = $(SRCS:.c=.o)
 TARGET = claude-c
 
@@ -41,9 +50,10 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Dependencies
-main.o: main.c api.h json.h image.h
+main.o: main.c api.h json.h image.h oauth.h
 api.o: api.c api.h auth.h json.h stream.h state.h
 auth.o: auth.c auth.h json.h
+oauth.o: oauth.c oauth.h auth.h json.h
 stream.o: stream.c stream.h json.h
 json.o: json.c json.h
 state.o: state.c state.h json.h

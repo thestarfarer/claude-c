@@ -152,7 +152,7 @@ static long long parse_iso_date(const char* iso_date) {
 
 /* Check if OAuth token needs refresh */
 int oauth_needs_refresh(long long expires_at) {
-    if (expires_at == 0) return 0;  /* No expiry info, assume valid */
+    if (expires_at == 0) return 1;  /* No expiry info, assume expired */
     long long now = current_time_ms();
     return now + OAUTH_REFRESH_BUFFER_MS >= expires_at;
 }
@@ -199,11 +199,8 @@ oauth_creds_t* oauth_load(void) {
     creds->refresh_token = json_get_string(content, "oauth.refreshToken");
     creds->scopes = json_get_string(content, "oauth.scopes");
 
-    char* expires_str = json_get_string(content, "oauth.expiresAt");
-    if (expires_str) {
-        creds->expires_at = parse_iso_date(expires_str);
-        free(expires_str);
-    }
+    int found_expires = 0;
+    creds->expires_at = json_get_number(content, "oauth.expiresAt", &found_expires);
 
     free(content);
     return creds;
@@ -302,30 +299,22 @@ int oauth_refresh(oauth_creds_t* creds) {
     response_t resp = {NULL, 0};
     struct curl_slist* headers = NULL;
 
-    /* Build request body */
-    char* escaped_refresh = curl_easy_escape(curl, creds->refresh_token, 0);
-    char* escaped_client = curl_easy_escape(curl, OAUTH_CLIENT_ID, 0);
-    char* escaped_scopes = curl_easy_escape(curl, OAUTH_SCOPES, 0);
-
-    size_t body_len = 256 + strlen(escaped_refresh) + strlen(escaped_client) + strlen(escaped_scopes);
+    /* Build JSON request body */
+    size_t body_len = 512 + strlen(creds->refresh_token);
     char* body = malloc(body_len);
     if (!body) {
-        curl_free(escaped_refresh);
-        curl_free(escaped_client);
-        curl_free(escaped_scopes);
         curl_easy_cleanup(curl);
         return -1;
     }
 
     snprintf(body, body_len,
-        "grant_type=refresh_token&refresh_token=%s&client_id=%s&scope=%s",
-        escaped_refresh, escaped_client, escaped_scopes);
+        "{\"grant_type\":\"refresh_token\","
+        "\"refresh_token\":\"%s\","
+        "\"client_id\":\"%s\","
+        "\"scope\":\"%s\"}",
+        creds->refresh_token, OAUTH_CLIENT_ID, OAUTH_SCOPES);
 
-    curl_free(escaped_refresh);
-    curl_free(escaped_client);
-    curl_free(escaped_scopes);
-
-    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
 
     curl_easy_setopt(curl, CURLOPT_URL, OAUTH_TOKEN_URL);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -344,7 +333,8 @@ int oauth_refresh(oauth_creds_t* creds) {
         if (http_code == 200 && resp.data) {
             char* new_access = json_get_string(resp.data, "access_token");
             char* new_refresh = json_get_string(resp.data, "refresh_token");
-            char* expires_in_str = json_get_string(resp.data, "expires_in");
+            int found_expires = 0;
+            long long expires_in = json_get_number(resp.data, "expires_in", &found_expires);
 
             if (new_access) {
                 /* Update credentials */
@@ -356,10 +346,8 @@ int oauth_refresh(oauth_creds_t* creds) {
                     creds->refresh_token = new_refresh;
                 }
 
-                if (expires_in_str) {
-                    long expires_in = atol(expires_in_str);
+                if (found_expires && expires_in > 0) {
                     creds->expires_at = current_time_ms() + (expires_in * 1000);
-                    free(expires_in_str);
                 }
 
                 /* Save updated credentials */
@@ -461,7 +449,7 @@ auth_t auth_load(void) {
 
     if (!creds) {
         fprintf(stderr, "No authentication found.\n");
-        fprintf(stderr, "Run 'claude' first to set up OAuth authentication,\n");
+        fprintf(stderr, "Run './claude-c --login' to authenticate,\n");
         fprintf(stderr, "or set ANTHROPIC_API_KEY environment variable.\n");
         return auth;
     }

@@ -180,6 +180,40 @@ int json_string_equals(const char* json, const char* key, const char* value) {
     return result;
 }
 
+long long json_get_number(const char* json, const char* key, int* found) {
+    if (found) *found = 0;
+    if (!json || !key) return 0;
+
+    /* Handle nested keys like "delta.count" */
+    char* key_copy = strdup(key);
+    if (!key_copy) return 0;
+
+    const char* current = json;
+    char* token = strtok(key_copy, ".");
+
+    while (token && current) {
+        current = find_key(current, token);
+        token = strtok(NULL, ".");
+    }
+
+    free(key_copy);
+
+    if (!current) return 0;
+
+    /* Skip whitespace and parse number */
+    current = skip_ws(current);
+    if (!*current || (!isdigit((unsigned char)*current) && *current != '-')) {
+        return 0;
+    }
+
+    char* endptr;
+    long long result = strtoll(current, &endptr, 10);
+    if (endptr != current && found) {
+        *found = 1;
+    }
+    return result;
+}
+
 char* json_escape_string(const char* str) {
     if (!str) return NULL;
 

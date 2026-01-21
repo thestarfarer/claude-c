@@ -14,6 +14,12 @@
  */
 char* json_get_string(const char* json, const char* key);
 
+/* Extract a number value from JSON by key path
+ * Returns the number or 0 if not found
+ * Sets *found to 1 if found, 0 if not (can be NULL if you don't care)
+ */
+long long json_get_number(const char* json, const char* key, int* found);
+
 /* Check if a JSON object has a specific string value for a key */
 int json_string_equals(const char* json, const char* key, const char* value);
 

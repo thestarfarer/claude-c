@@ -6,6 +6,7 @@
 
 #include "oauth.h"
 #include "auth.h"
+#include "api.h"
 #include "json.h"
 #include <stdio.h>
 #include <stdlib.h>

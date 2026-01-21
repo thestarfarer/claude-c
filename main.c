@@ -19,6 +19,9 @@
 #define VERSION "1.2.0"
 #define MAX_IMAGES 16
 
+/* Global verbose flag */
+int verbose = 0;
+
 static struct option long_options[] = {
     {"print",         no_argument,       0, 'p'},
     {"stream",        no_argument,       0, 'S'},
@@ -30,6 +33,7 @@ static struct option long_options[] = {
     {"request",       required_argument, 0, 'r'},
     {"json-output",   no_argument,       0, 'J'},
     {"login",         no_argument,       0, 'L'},
+    {"verbose",       no_argument,       0, 1},
     {"help",          no_argument,       0, 'h'},
     {"version",       no_argument,       0, 'v'},
     {0, 0, 0, 0}
@@ -52,6 +56,7 @@ static void print_usage(const char* prog) {
         "  -r, --request FILE       Full request body JSON file (@file.json)\n"
         "  -J, --json-output        Output raw API response JSON\n"
         "  -L, --login              Authenticate with Claude (OAuth)\n"
+        "      --verbose            Verbose output (show debug info)\n"
         "  -h, --help               Show this help\n"
         "  -v, --version            Show version\n"
         "\n"
@@ -323,6 +328,9 @@ int main(int argc, char** argv) {
                     curl_global_cleanup();
                     return result;
                 }
+            case 1:  /* --verbose (no short option) */
+                verbose = 1;
+                break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;

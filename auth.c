@@ -8,6 +8,7 @@
 #define _GNU_SOURCE  /* For timegm() */
 
 #include "auth.h"
+#include "api.h"
 #include "json.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,7 +355,7 @@ int oauth_refresh(oauth_creds_t* creds) {
                 oauth_save(creds);
                 result = 0;
 
-                fprintf(stderr, "OAuth token refreshed successfully\n");
+                DEBUG("OAuth token refreshed successfully\n");
             } else {
                 free(new_refresh);
             }
@@ -414,7 +415,7 @@ int oauth_migrate_from_claude_code(void) {
     int result = oauth_save(&creds);
 
     if (result == 0) {
-        fprintf(stderr, "Migrated OAuth credentials from Claude Code\n");
+        DEBUG("Migrated OAuth credentials from Claude Code\n");
     }
 
     /* Free strings (oauth_save made copies) */
@@ -456,7 +457,7 @@ auth_t auth_load(void) {
 
     /* Check if token needs refresh */
     if (creds->refresh_token && oauth_needs_refresh(creds->expires_at)) {
-        fprintf(stderr, "OAuth token expired or expiring soon, refreshing...\n");
+        DEBUG("OAuth token expired or expiring soon, refreshing...\n");
         if (oauth_refresh(creds) != 0) {
             fprintf(stderr, "Token refresh failed. Try running 'claude' to re-authenticate.\n");
             oauth_creds_free(creds);

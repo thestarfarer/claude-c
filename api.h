@@ -7,6 +7,10 @@
 
 #include <stdio.h>
 
+/* Verbose output flag - set via -v/--verbose */
+extern int verbose;
+#define DEBUG(...) do { if (verbose) fprintf(stderr, __VA_ARGS__); } while(0)
+
 /* API configuration */
 #define API_BASE_URL "https://api.anthropic.com"
 #define API_MESSAGES_PATH "/v1/messages"

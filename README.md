@@ -1,11 +1,11 @@
 # claude-c
 
-Minimal Claude API client in C. 31KB binary, zero Node.js dependency.
+Minimal Claude Code API client in C.
 
 ## Build
 
 ```bash
-# Requires libcurl
+# Requires libcurl and OpenSSL
 make
 ```
 
@@ -53,6 +53,10 @@ echo "What is 2+2?" | ./claude-c -p -s "Be concise, reply with just the answer"
 | `-t, --max-tokens` | Max output tokens (default: 16384) |
 | `-r, --request` | Full request body JSON file (`@file.json`) |
 | `-J, --json-output` | Output raw API response JSON |
+| `-L, --login` | Authenticate with Claude (OAuth) |
+| `--verbose` | Verbose output (show debug info) |
+| `-h, --help` | Show help |
+| `-v, --version` | Show version |
 
 ## Raw Request Mode
 
@@ -208,9 +212,10 @@ Image type is detected from magic bytes, not file extension.
 
 Checks in order:
 1. `ANTHROPIC_API_KEY` environment variable
-2. OAuth token from `~/.claude/.credentials.json`
+2. OAuth token from `~/.claude/claude-c.json` (claude-c's own storage)
+3. Migrate credentials from `~/.claude/.credentials.json` (Claude Code) on first run
 
-The OAuth token is created by the official `claude` CLI. Just run `claude` once to authenticate, then `claude-c` will use the same credentials.
+Run `./claude-c --login` to authenticate independently, or set `ANTHROPIC_API_KEY`. Existing Claude Code credentials are automatically migrated on first use.
 
 ## How It Works
 
@@ -241,22 +246,14 @@ On first run with OAuth, makes an extra API call to fetch the account profile. S
 claude-c/
 ├── main.c      # Entry point, argument parsing
 ├── api.c       # HTTP requests, request/response handling
-├── auth.c      # OAuth token loading
+├── auth.c      # OAuth token loading, refresh, credential migration
+├── oauth.c     # OAuth 2.0 PKCE login flow
 ├── state.c     # Persistent state and metadata spoofing
 ├── stream.c    # SSE stream parser
 ├── json.c      # Minimal JSON parser
 ├── image.c     # Image loading, base64 encoding, MIME detection
 └── Makefile
 ```
-
-## Size Comparison
-
-| | claude-c | Node.js CLI |
-|-|----------|-------------|
-| Binary | 48 KB | 11 MB |
-| Source | 2,600 lines | 538,000 lines |
-| Startup | instant | ~500ms |
-| Dependencies | libcurl | Node.js runtime |
 
 ## Models
 

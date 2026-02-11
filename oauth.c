@@ -73,7 +73,7 @@ static char* random_base64url(size_t bytes) {
 }
 
 /* SHA256 hash */
-static unsigned char* sha256(const char* input, size_t* out_len) {
+unsigned char* sha256(const char* input, size_t* out_len) {
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) return NULL;
 

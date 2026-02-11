@@ -214,6 +214,116 @@ long long json_get_number(const char* json, const char* key, int* found) {
     return result;
 }
 
+/* Extract text content of first user message from a JSON request body or messages array.
+ * Handles: {"messages":[{"role":"user","content":"text"},...]}
+ * And:     {"messages":[{"role":"user","content":[{"type":"text","text":"..."},...]},... ]}
+ * And:     [{"role":"user","content":"text"},...]  (bare messages array)
+ * Returns newly allocated string or NULL. Caller must free().
+ */
+char* json_extract_first_user_text(const char* json) {
+    if (!json) return NULL;
+
+    const char* p = skip_ws(json);
+
+    /* If it's an object, find "messages" key; if array, use directly */
+    const char* arr;
+    if (*p == '{') {
+        arr = find_key(p, "messages");
+        if (!arr) return NULL;
+        arr = skip_ws(arr);
+    } else if (*p == '[') {
+        arr = p;
+    } else {
+        return NULL;
+    }
+
+    if (*arr != '[') return NULL;
+    p = arr + 1;
+
+    /* Iterate array elements */
+    while (1) {
+        p = skip_ws(p);
+        if (!*p || *p == ']') break;
+        if (*p != '{') { p = skip_value(p); goto next_msg; }
+
+        /* Remember start of this object, find its extent */
+        const char* obj_start = p;
+        const char* obj_end = skip_value(p);
+        size_t obj_len = obj_end - obj_start;
+
+        /* Null-terminate a copy for safe parsing */
+        char* obj = malloc(obj_len + 1);
+        if (!obj) return NULL;
+        memcpy(obj, obj_start, obj_len);
+        obj[obj_len] = '\0';
+
+        /* Check role */
+        char* role = json_get_string(obj, "role");
+        if (!role || strcmp(role, "user") != 0) {
+            free(role);
+            free(obj);
+            p = obj_end;
+            goto next_msg;
+        }
+        free(role);
+
+        /* Found first user message. Get content. */
+        const char* content_ptr = find_key(obj, "content");
+        if (!content_ptr) { free(obj); return NULL; }
+        content_ptr = skip_ws(content_ptr);
+
+        if (*content_ptr == '"') {
+            /* String content */
+            char* result = parse_string(content_ptr);
+            free(obj);
+            return result;
+        }
+
+        if (*content_ptr == '[') {
+            /* Array content - find first {"type":"text","text":"..."} */
+            const char* ap = content_ptr + 1;
+            while (1) {
+                ap = skip_ws(ap);
+                if (!*ap || *ap == ']') break;
+                if (*ap != '{') { ap = skip_value(ap); goto next_block; }
+
+                const char* block_start = ap;
+                const char* block_end = skip_value(ap);
+                size_t block_len = block_end - block_start;
+
+                char* block = malloc(block_len + 1);
+                if (!block) { free(obj); return NULL; }
+                memcpy(block, block_start, block_len);
+                block[block_len] = '\0';
+
+                if (json_string_equals(block, "type", "text")) {
+                    char* text = json_get_string(block, "text");
+                    free(block);
+                    free(obj);
+                    return text;
+                }
+                free(block);
+                ap = block_end;
+
+            next_block:
+                ap = skip_ws(ap);
+                if (*ap == ',') ap++;
+            }
+            free(obj);
+            return NULL;
+        }
+
+        free(obj);
+        return NULL;
+
+    next_msg:
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+
+    return NULL;
+}
+
 char* json_escape_string(const char* str) {
     if (!str) return NULL;
 

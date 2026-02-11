@@ -51,7 +51,7 @@ $(TARGET): $(OBJS)
 
 # Dependencies
 main.o: main.c api.h json.h image.h oauth.h
-api.o: api.c api.h auth.h json.h stream.h state.h
+api.o: api.c api.h auth.h json.h stream.h state.h oauth.h
 auth.o: auth.c auth.h json.h
 oauth.o: oauth.c oauth.h auth.h json.h
 stream.o: stream.c stream.h json.h

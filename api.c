@@ -7,10 +7,15 @@
 #include "json.h"
 #include "stream.h"
 #include "state.h"
+#include "oauth.h"
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* Billing header constants */
+#define BILLING_SALT "59cf53e54c78"
+#define BILLING_VERSION "2.1.39"
 
 /* Context for streaming curl callbacks */
 typedef struct {
@@ -76,10 +81,48 @@ static size_t buffer_write_callback(char* ptr, size_t size, size_t nmemb, void* 
     return bytes;
 }
 
+/* Compute billing header string from first user message text.
+ * Returns allocated string like:
+ *   x-anthropic-billing-header: cc_version=2.1.39.abc; cc_entrypoint=cli; cch=00000;
+ * Caller must free(). Returns NULL on failure.
+ */
+static char* compute_billing_header(const char* first_user_text) {
+    /* Extract chars at positions 4, 7, 20 (or '0' for out-of-bounds) */
+    size_t len = first_user_text ? strlen(first_user_text) : 0;
+    char c4  = (len > 4)  ? first_user_text[4]  : '0';
+    char c7  = (len > 7)  ? first_user_text[7]  : '0';
+    char c20 = (len > 20) ? first_user_text[20] : '0';
+
+    /* Build hash input: salt + chars + version */
+    char input[64];
+    snprintf(input, sizeof(input), "%s%c%c%c%s", BILLING_SALT, c4, c7, c20, BILLING_VERSION);
+
+    /* SHA256 */
+    size_t hash_len;
+    unsigned char* hash = sha256(input, &hash_len);
+    if (!hash) return NULL;
+
+    /* Take first 3 hex chars */
+    char hash_hex[4];
+    snprintf(hash_hex, sizeof(hash_hex), "%02x%01x", hash[0], (hash[1] >> 4) & 0x0f);
+    free(hash);
+
+    /* Build billing header string */
+    char* result = malloc(128);
+    if (!result) return NULL;
+
+    snprintf(result, 128,
+        "x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;",
+        BILLING_VERSION, hash_hex);
+
+    return result;
+}
+
 /* Build request body JSON */
 static char* build_request_body(const char* model, const char* system_prompt,
                                  const char* messages_json, int max_tokens,
-                                 int stream, const char* metadata_user_id) {
+                                 int stream, const char* metadata_user_id,
+                                 const char* first_user_text) {
     /* Escape system prompt if provided */
     char* escaped_prompt = NULL;
     if (system_prompt) {
@@ -87,11 +130,24 @@ static char* build_request_body(const char* model, const char* system_prompt,
         if (!escaped_prompt) return NULL;
     }
 
+    /* Compute billing header */
+    char* billing = compute_billing_header(first_user_text);
+
+    /* Build billing block for system array */
+    char billing_block[256] = "";
+    if (billing) {
+        snprintf(billing_block, sizeof(billing_block),
+            "{\"type\":\"text\",\"text\":\"%s\"},", billing);
+        free(billing);
+        billing = NULL;
+    }
+
     /* Calculate buffer size (generous) */
     size_t prompt_len = escaped_prompt ? strlen(escaped_prompt) : 0;
     size_t messages_len = messages_json ? strlen(messages_json) : 2;
     size_t metadata_len = metadata_user_id ? strlen(metadata_user_id) : 8;
-    size_t buf_size = 2048 + prompt_len + messages_len + metadata_len;
+    size_t billing_len = strlen(billing_block);
+    size_t buf_size = 2048 + prompt_len + messages_len + metadata_len + billing_len;
 
     char* body = malloc(buf_size);
     if (!body) {
@@ -102,7 +158,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
     const char* stream_str = stream ? "true" : "false";
     const char* user_id = metadata_user_id ? metadata_user_id : "claude-c";
 
-    /* Build JSON - identity string MUST be separate content block */
+    /* Build JSON - billing header first, then identity, then user prompt */
     if (escaped_prompt) {
         snprintf(body, buf_size,
             "{"
@@ -110,6 +166,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
             "\"max_tokens\":%d,"
             "\"stream\":%s,"
             "\"system\":["
+                "%s"
                 "{\"type\":\"text\",\"text\":\"%s\"},"
                 "{\"type\":\"text\",\"text\":\"%s\"}"
             "],"
@@ -119,6 +176,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
             model,
             max_tokens,
             stream_str,
+            billing_block,
             IDENTITY_AGENT,
             escaped_prompt,
             messages_json ? messages_json : "[]",
@@ -132,6 +190,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
             "\"max_tokens\":%d,"
             "\"stream\":%s,"
             "\"system\":["
+                "%s"
                 "{\"type\":\"text\",\"text\":\"%s\"}"
             "],"
             "\"messages\":%s,"
@@ -140,6 +199,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
             model,
             max_tokens,
             stream_str,
+            billing_block,
             IDENTITY_AGENT,
             messages_json ? messages_json : "[]",
             user_id
@@ -334,6 +394,9 @@ int api_send_message(const char* model, const char* system_prompt,
         headers = curl_slist_append(headers, beta_header);
     }
 
+    /* Extract first user message text for billing header */
+    char* first_user_text = json_extract_first_user_text(messages_json);
+
     /* Build request body */
     body = build_request_body(
         model ? model : DEFAULT_MODEL,
@@ -341,8 +404,10 @@ int api_send_message(const char* model, const char* system_prompt,
         messages_json,
         max_tokens > 0 ? max_tokens : DEFAULT_MAX_TOKENS,
         stream,
-        metadata_user_id
+        metadata_user_id,
+        first_user_text
     );
+    free(first_user_text);
 
     if (!body) {
         fprintf(stderr, "Error: Failed to build request body\n");
@@ -452,6 +517,19 @@ static char* inject_identity_and_metadata(const char* request_body, const char* 
     const char* identity_block = "{\"type\":\"text\",\"text\":\"" IDENTITY_AGENT "\"}";
     size_t identity_len = strlen(identity_block);
 
+    /* Compute billing header from first user message */
+    char* first_user_text = json_extract_first_user_text(request_body);
+    char* billing = compute_billing_header(first_user_text);
+    free(first_user_text);
+
+    char billing_block[256] = "";
+    if (billing) {
+        snprintf(billing_block, sizeof(billing_block),
+            "{\"type\":\"text\",\"text\":\"%s\"},", billing);
+        free(billing);
+    }
+    size_t billing_len = strlen(billing_block);
+
     /* Calculate size for metadata */
     char metadata_json[512];
     snprintf(metadata_json, sizeof(metadata_json),
@@ -460,7 +538,7 @@ static char* inject_identity_and_metadata(const char* request_body, const char* 
     size_t metadata_len = strlen(metadata_json);
 
     /* Allocate generous buffer */
-    size_t buf_size = request_len + identity_len + metadata_len + 256;
+    size_t buf_size = request_len + billing_len + identity_len + metadata_len + 256;
     char* result = malloc(buf_size);
     if (!result) return NULL;
 
@@ -484,6 +562,12 @@ static char* inject_identity_and_metadata(const char* request_body, const char* 
         size_t prefix_len = system_array_start - request_body + 1;
         memcpy(out, request_body, prefix_len);
         out += prefix_len;
+
+        /* Insert billing block (before identity) */
+        if (billing_len > 0) {
+            memcpy(out, billing_block, billing_len);
+            out += billing_len;
+        }
 
         /* Insert identity block */
         memcpy(out, identity_block, identity_len);
@@ -533,8 +617,8 @@ static char* inject_identity_and_metadata(const char* request_body, const char* 
         /* Copy { */
         *out++ = '{';
 
-        /* Add system array with identity */
-        out += sprintf(out, "\"system\":[%s],", identity_block);
+        /* Add system array with billing + identity */
+        out += sprintf(out, "\"system\":[%s%s],", billing_block, identity_block);
 
         /* Copy rest of original content (skip the {) */
         const char* content_start = open_brace + 1;
@@ -598,7 +682,7 @@ int api_send_raw_request(const char* request_body, int json_output, FILE* output
     /* Build metadata user_id */
     metadata_user_id = state_build_metadata(&state, session_id);
 
-    /* Inject identity string and metadata into request body */
+    /* Inject identity string, billing header, and metadata into request body */
     body = inject_identity_and_metadata(request_body, metadata_user_id);
     if (!body) {
         fprintf(stderr, "Error: Failed to process request body\n");

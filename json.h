@@ -23,6 +23,12 @@ long long json_get_number(const char* json, const char* key, int* found);
 /* Check if a JSON object has a specific string value for a key */
 int json_string_equals(const char* json, const char* key, const char* value);
 
+/* Extract text content of first user message from request JSON or messages array.
+ * Returns newly allocated string or NULL if not found.
+ * Caller must free() the result.
+ */
+char* json_extract_first_user_text(const char* json);
+
 /* Escape a string for JSON embedding
  * Returns newly allocated string, caller must free()
  */

@@ -9,6 +9,13 @@
 #define OAUTH_H
 
 #include "auth.h"
+#include <stddef.h>
+
+/* SHA256 hash (shared with api.c for billing header)
+ * Returns allocated hash bytes, caller must free()
+ * out_len receives the hash length (32 bytes)
+ */
+unsigned char* sha256(const char* input, size_t* out_len);
 
 /* PKCE parameters */
 typedef struct {

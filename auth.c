@@ -313,7 +313,7 @@ int oauth_refresh(oauth_creds_t* creds) {
         "\"refresh_token\":\"%s\","
         "\"client_id\":\"%s\","
         "\"scope\":\"%s\"}",
-        creds->refresh_token, OAUTH_CLIENT_ID, OAUTH_SCOPES);
+        creds->refresh_token, OAUTH_CLIENT_ID, OAUTH_REFRESH_SCOPES);
 
     headers = curl_slist_append(headers, "Content-Type: application/json");
 

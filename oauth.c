@@ -21,7 +21,7 @@
 #include <openssl/rand.h>
 #include <curl/curl.h>
 
-#define PKCE_VERIFIER_LEN 64
+#define PKCE_VERIFIER_LEN 32
 #define STATE_LEN 32
 #define DEFAULT_PORT 8765
 #define CALLBACK_TIMEOUT 600
@@ -160,7 +160,7 @@ char* oauth_build_auth_url(const pkce_t* pkce, int port) {
         "&client_id=%s"
         "&response_type=code"
         "&redirect_uri=http://localhost:%d/callback"
-        "&scope=user:profile%%20user:inference%%20user:sessions:claude_code"
+        "&scope=org:create_api_key%%20user:profile%%20user:inference%%20user:sessions:claude_code%%20user:mcp_servers"
         "&code_challenge=%s"
         "&code_challenge_method=S256"
         "&state=%s",

@@ -16,7 +16,7 @@ extern int verbose;
 #define API_MESSAGES_PATH "/v1/messages"
 #define API_VERSION "2023-06-01"
 #define OAUTH_BETA "oauth-2025-04-20"
-#define USER_AGENT "claude-cli/2.1.39 (external, cli)"
+#define USER_AGENT "claude-cli/2.1.72 (external, cli)"
 
 /* Identity strings - must match server whitelist exactly */
 #define IDENTITY_AGENT "You are a Claude agent, built on Anthropic's Claude Agent SDK."

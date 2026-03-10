@@ -15,7 +15,7 @@
 
 /* Billing header constants */
 #define BILLING_SALT "59cf53e54c78"
-#define BILLING_VERSION "2.1.39"
+#define BILLING_VERSION "2.1.72"
 
 /* Context for streaming curl callbacks */
 typedef struct {

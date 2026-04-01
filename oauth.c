@@ -160,7 +160,7 @@ char* oauth_build_auth_url(const pkce_t* pkce, int port) {
         "&client_id=%s"
         "&response_type=code"
         "&redirect_uri=http://localhost:%d/callback"
-        "&scope=org:create_api_key%%20user:profile%%20user:inference%%20user:sessions:claude_code%%20user:mcp_servers"
+        "&scope=org:create_api_key%%20user:profile%%20user:inference%%20user:sessions:claude_code%%20user:mcp_servers%%20user:file_upload"
         "&code_challenge=%s"
         "&code_challenge_method=S256"
         "&state=%s",

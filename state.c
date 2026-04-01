@@ -148,7 +148,7 @@ static int ensure_dir(const char* path) {
 }
 
 state_t state_load(void) {
-    state_t state = {NULL, NULL};
+    state_t state = {NULL, NULL, NULL};
 
     char* path = get_state_path();
     if (!path) {
@@ -160,14 +160,22 @@ state_t state_load(void) {
     if (content) {
         state.user_id = json_get_string(content, "userId");
         state.account_uuid = json_get_string(content, "accountUuid");
+        state.session_id = json_get_string(content, "sessionId");
         free(content);
     }
 
-    /* Generate user_id if missing */
+    /* Generate user_id and session_id if missing */
+    int need_save = 0;
     if (!state.user_id) {
         state.user_id = generate_user_id();
-        state_save(&state);
+        need_save = 1;
     }
+    if (!state.session_id) {
+        state.session_id = malloc(37);
+        if (state.session_id) generate_uuid_v4(state.session_id);
+        need_save = 1;
+    }
+    if (need_save) state_save(&state);
 
     free(path);
     return state;
@@ -220,6 +228,12 @@ int state_save(const state_t* state) {
         has_prev = 1;
     }
 
+    if (state->session_id) {
+        if (has_prev) fprintf(f, ",\n");
+        fprintf(f, "  \"sessionId\": \"%s\"", state->session_id);
+        has_prev = 1;
+    }
+
     /* Preserve oauth credentials if they exist */
     if (oauth_access) {
         if (has_prev) fprintf(f, ",\n");
@@ -255,8 +269,10 @@ void state_free(state_t* state) {
     if (!state) return;
     free(state->user_id);
     free(state->account_uuid);
+    free(state->session_id);
     state->user_id = NULL;
     state->account_uuid = NULL;
+    state->session_id = NULL;
 }
 
 /* Curl write callback */
@@ -333,16 +349,18 @@ int state_fetch_profile(state_t* state, const char* access_token) {
     return result;
 }
 
-char* state_build_metadata(const state_t* state, const char* session_id) {
-    const char* user_id = state->user_id ? state->user_id : "";
+char* state_build_metadata(const state_t* state) {
+    const char* device_id = state->user_id ? state->user_id : "";
     const char* account = state->account_uuid ? state->account_uuid : "";
-    const char* session = session_id ? session_id : "";
+    const char* session = state->session_id ? state->session_id : "";
 
-    /* Format: user_{userId}_account_{accountUuid}_session_{sessionId} */
-    size_t len = 6 + strlen(user_id) + 9 + strlen(account) + 9 + strlen(session) + 1;
+    /* Format: {"device_id":"...","account_uuid":"...","session_id":"..."} */
+    size_t len = 64 + strlen(device_id) + strlen(account) + strlen(session);
     char* result = malloc(len);
     if (!result) return NULL;
 
-    snprintf(result, len, "user_%s_account_%s_session_%s", user_id, account, session);
+    snprintf(result, len,
+        "{\\\"device_id\\\":\\\"%s\\\",\\\"account_uuid\\\":\\\"%s\\\",\\\"session_id\\\":\\\"%s\\\"}",
+        device_id, account, session);
     return result;
 }

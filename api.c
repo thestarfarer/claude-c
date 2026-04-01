@@ -15,7 +15,7 @@
 
 /* Billing header constants */
 #define BILLING_SALT "59cf53e54c78"
-#define BILLING_VERSION "2.1.72"
+#define BILLING_VERSION "2.1.89"
 
 /* Context for streaming curl callbacks */
 typedef struct {
@@ -319,16 +319,14 @@ int api_send_message(const char* model, const char* system_prompt,
 
     /* Load persistent state and build metadata */
     state = state_load();
-    char session_id[37];
-    generate_uuid_v4(session_id);
 
     /* Fetch profile if OAuth and no cached account_uuid */
     if (auth.type == AUTH_OAUTH && !state.account_uuid) {
         state_fetch_profile(&state, auth.value);
     }
 
-    /* Build metadata user_id: user_{id}_account_{uuid}_session_{uuid} */
-    metadata_user_id = state_build_metadata(&state, session_id);
+    /* Build metadata user_id as JSON */
+    metadata_user_id = state_build_metadata(&state);
 
     /* Initialize curl */
     curl = curl_easy_init();
@@ -379,6 +377,13 @@ int api_send_message(const char* model, const char* system_prompt,
     headers = curl_slist_append(headers, ua_header);
 
     headers = curl_slist_append(headers, "x-app: cli");
+
+    /* Add session ID header */
+    if (state.session_id) {
+        char session_header[128];
+        snprintf(session_header, sizeof(session_header), "X-Claude-Code-Session-Id: %s", state.session_id);
+        headers = curl_slist_append(headers, session_header);
+    }
 
     /* Add auth header */
     char auth_header[512];
@@ -671,16 +676,14 @@ int api_send_raw_request(const char* request_body, int json_output, FILE* output
 
     /* Load persistent state and build metadata */
     state = state_load();
-    char session_id[37];
-    generate_uuid_v4(session_id);
 
     /* Fetch profile if OAuth and no cached account_uuid */
     if (auth.type == AUTH_OAUTH && !state.account_uuid) {
         state_fetch_profile(&state, auth.value);
     }
 
-    /* Build metadata user_id */
-    metadata_user_id = state_build_metadata(&state, session_id);
+    /* Build metadata user_id as JSON */
+    metadata_user_id = state_build_metadata(&state);
 
     /* Inject identity string, billing header, and metadata into request body */
     body = inject_identity_and_metadata(request_body, metadata_user_id);
@@ -734,6 +737,13 @@ int api_send_raw_request(const char* request_body, int json_output, FILE* output
     headers = curl_slist_append(headers, ua_header);
 
     headers = curl_slist_append(headers, "x-app: cli");
+
+    /* Add session ID header */
+    if (state.session_id) {
+        char session_header[128];
+        snprintf(session_header, sizeof(session_header), "X-Claude-Code-Session-Id: %s", state.session_id);
+        headers = curl_slist_append(headers, session_header);
+    }
 
     /* Add auth header */
     char auth_header[512];

@@ -12,11 +12,11 @@
 #include <time.h>
 
 /* OAuth configuration - must match Claude Code */
-#define OAUTH_AUTHORIZE_URL "https://claude.ai/oauth/authorize"
+#define OAUTH_AUTHORIZE_URL "https://claude.com/cai/oauth/authorize"
 #define OAUTH_TOKEN_URL "https://platform.claude.com/v1/oauth/token"
 #define OAUTH_CLIENT_ID "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-#define OAUTH_SCOPES "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers"
-#define OAUTH_REFRESH_SCOPES "user:profile user:inference user:sessions:claude_code user:mcp_servers"
+#define OAUTH_SCOPES "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+#define OAUTH_REFRESH_SCOPES "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 #define OAUTH_REFRESH_BUFFER_MS 300000  /* 5 minutes before expiry */
 
 /* Authentication type */

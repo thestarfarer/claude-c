@@ -12,6 +12,7 @@
 typedef struct {
     char* user_id;       /* 64-char hex, persisted across sessions */
     char* account_uuid;  /* From OAuth profile, cached */
+    char* session_id;    /* UUID v4, persisted across processes */
 } state_t;
 
 /* Load or create persistent state
@@ -38,11 +39,10 @@ void generate_uuid_v4(char* buf);
  */
 int state_fetch_profile(state_t* state, const char* access_token);
 
-/* Build the full metadata user_id string
- * Format: user_{userID}_account_{accountUuid}_session_{sessionId}
- * session_id should be a UUID v4 string
+/* Build the metadata user_id JSON string
+ * Format: {"device_id":"...","account_uuid":"...","session_id":"..."}
  * Returns newly allocated string, caller must free()
  */
-char* state_build_metadata(const state_t* state, const char* session_id);
+char* state_build_metadata(const state_t* state);
 
 #endif /* STATE_H */

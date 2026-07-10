@@ -44,4 +44,12 @@ char* json_escape_string(const char* str);
  */
 char* json_add_cache_control_last_message(const char* messages_json);
 
+/* Return a newly-allocated copy of a full request body (or bare system array)
+ * with `"cache_control":{"type":"ephemeral"}` added to the LAST block of the
+ * "system" array. Returns NULL on any parse failure. Caller must free() a
+ * non-NULL result. Used to cache the system prefix in raw request mode, where
+ * the client-built templates in build_request_body() don't apply.
+ */
+char* json_add_cache_control_last_system_block(const char* body);
+
 #endif /* JSON_H */

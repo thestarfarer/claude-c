@@ -468,3 +468,51 @@ char* json_add_cache_control_last_message(const char* messages_json) {
     out[o] = '\0';
     return out;
 }
+
+/* Add cache_control to the last block of the "system" array of a full request
+ * body (or a bare system array). Used by raw request mode. Same splice
+ * technique as the array-content branch above; system blocks are always
+ * objects. Returns NULL (caller keeps the original) on anything unexpected. */
+char* json_add_cache_control_last_system_block(const char* body) {
+    if (!body) return NULL;
+
+    const char* p = skip_ws(body);
+    const char* arr = NULL;
+    if (*p == '[') {
+        arr = p;
+    } else if (*p == '{') {
+        const char* v = find_key(body, "system");
+        if (!v) return NULL;
+        v = skip_ws(v);
+        if (*v != '[') return NULL;
+        arr = v;
+    } else {
+        return NULL;
+    }
+
+    /* Walk to the last block object in the system array. */
+    const char* blk_end = NULL;
+    const char* q = arr + 1;
+    for (;;) {
+        q = skip_ws(q);
+        if (*q == ']' || *q == '\0') break;
+        const char* bs = q;
+        const char* be = skip_value(q);
+        if (be <= bs) return NULL;
+        blk_end = be;
+        q = skip_ws(be);
+        if (*q == ',') q++;
+    }
+    if (!blk_end || *(blk_end - 1) != '}') return NULL;  /* empty or non-object */
+
+    size_t in_len = strlen(body);
+    char* out = malloc(in_len + 64);
+    if (!out) return NULL;
+    size_t head = (size_t)((blk_end - 1) - body);   /* up to last block's '}' */
+    size_t cclen = sizeof(CACHE_CONTROL_FIELD) - 1;
+    memcpy(out, body, head);
+    memcpy(out + head, CACHE_CONTROL_FIELD, cclen);
+    memcpy(out + head + cclen, body + head, in_len - head);
+    out[in_len + cclen] = '\0';
+    return out;
+}

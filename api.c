@@ -763,7 +763,7 @@ static char* inject_identity_and_metadata(const char* request_body, const char* 
     return result;
 }
 
-int api_send_raw_request(const char* request_body, int json_output, FILE* output) {
+int api_send_raw_request(const char* request_body, int json_output, int cache, FILE* output) {
     int result = 1;
     CURL* curl = NULL;
     struct curl_slist* headers = NULL;
@@ -800,6 +800,18 @@ int api_send_raw_request(const char* request_body, int json_output, FILE* output
         free(metadata_user_id);
         return 1;
     }
+
+    /* Optional prompt caching: mark the last message and last system block of
+       the injected body (see build_request_body for the caching model). Each
+       helper returns a new copy or NULL (keep previous) on parse failure. */
+    if (cache) {
+        char* cm = json_add_cache_control_last_message(body);
+        if (cm) { free(body); body = cm; }
+        char* cs = json_add_cache_control_last_system_block(body);
+        if (cs) { free(body); body = cs; }
+    }
+
+    DEBUG("Request body: %s\n", body);
 
     /* Initialize curl */
     curl = curl_easy_init();

@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
     /* Raw request mode: send full request body directly */
     if (request_body) {
         curl_global_init(CURL_GLOBAL_DEFAULT);
-        int result = api_send_raw_request(request_body, json_output, stdout);
+        int result = api_send_raw_request(request_body, json_output, cache, stdout);
         curl_global_cleanup();
         if (request_body_allocated) {
             free(request_body);

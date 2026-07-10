@@ -55,6 +55,8 @@ int api_send_message(
  *                 Identity string and metadata will be injected automatically
  * - json_output: If non-zero, output raw API response JSON
  *                If zero, extract and output text content only
+ * - cache: If non-zero, add prompt-cache breakpoints to the last system block
+ *          and last message of the (post-injection) body
  * - output: Output to this file (usually stdout)
  *
  * Returns 0 on success, non-zero on error
@@ -62,6 +64,7 @@ int api_send_message(
 int api_send_raw_request(
     const char* request_body,
     int json_output,
+    int cache,
     FILE* output
 );
 

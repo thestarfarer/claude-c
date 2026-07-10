@@ -83,7 +83,9 @@ Notes:
 - Append-only only. If you mutate a message already in the history (e.g. inject
   a drifting appendage mid-conversation), the cache breaks from that point —
   handling that would need a stable-prefix breakpoint, which is not implemented.
-- Ignored in raw request mode (`-r`): supply your own `cache_control` there.
+- Also works in raw request mode (`-r`): the last system block and last message
+  of your body are marked automatically. If your body already sets its own
+  `cache_control`, omit `--cache` to avoid duplicate markers.
 
 ## Raw Request Mode
 

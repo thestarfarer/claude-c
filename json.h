@@ -34,4 +34,14 @@ char* json_extract_first_user_text(const char* json);
  */
 char* json_escape_string(const char* str);
 
+/* Return a newly-allocated copy of a messages array (bare array, or object with
+ * a "messages" key) with `"cache_control":{"type":"ephemeral"}` added to the
+ * last content block of the LAST message. If that message's content is a bare
+ * string it is promoted to a one-element text block array so the marker has a
+ * block to attach to. Returns NULL on any parse failure (caller should then
+ * fall back to the original messages unchanged). Caller must free() a non-NULL
+ * result.
+ */
+char* json_add_cache_control_last_message(const char* messages_json);
+
 #endif /* JSON_H */

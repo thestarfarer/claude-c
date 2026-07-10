@@ -33,6 +33,7 @@ static struct option long_options[] = {
     {"request",       required_argument, 0, 'r'},
     {"json-output",   no_argument,       0, 'J'},
     {"login",         no_argument,       0, 'L'},
+    {"cache",         no_argument,       0, 2},
     {"verbose",       no_argument,       0, 1},
     {"help",          no_argument,       0, 'h'},
     {"version",       no_argument,       0, 'v'},
@@ -56,6 +57,7 @@ static void print_usage(const char* prog) {
         "  -r, --request FILE       Full request body JSON file (@file.json)\n"
         "  -J, --json-output        Output raw API response JSON\n"
         "  -L, --login              Authenticate with Claude (OAuth)\n"
+        "      --cache              Add prompt-cache breakpoints (append-only convos)\n"
         "      --verbose            Verbose output (show debug info)\n"
         "  -h, --help               Show this help\n"
         "  -v, --version            Show version\n"
@@ -255,6 +257,7 @@ static char* build_messages_with_images(const char* text, image_t** images, int 
 int main(int argc, char** argv) {
     int print_mode = 0;
     int stream_mode = 0;
+    int cache = 0;
     char* system_prompt = NULL;
     char* messages = NULL;
     char* model = NULL;
@@ -328,6 +331,9 @@ int main(int argc, char** argv) {
                     curl_global_cleanup();
                     return result;
                 }
+            case 2:  /* --cache (no short option) */
+                cache = 1;
+                break;
             case 1:  /* --verbose (no short option) */
                 verbose = 1;
                 break;
@@ -435,7 +441,7 @@ int main(int argc, char** argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     /* Make the API call */
-    int result = api_send_message(model, system_prompt, messages, max_tokens, stream_mode, stdout);
+    int result = api_send_message(model, system_prompt, messages, max_tokens, stream_mode, cache, stdout);
 
     /* Cleanup */
     curl_global_cleanup();

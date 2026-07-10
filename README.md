@@ -49,14 +49,41 @@ echo "What is 2+2?" | ./claude-c -p -s "Be concise, reply with just the answer"
 | `-s, --system-prompt` | Custom system prompt |
 | `-m, --messages` | Messages JSON array or `@file.json` |
 | `-i, --image` | Attach image file (can use multiple times, max 16) |
-| `-M, --model` | Model ID (default: claude-sonnet-4-5-20250929) |
+| `-M, --model` | Model ID (default: claude-opus-4-8) |
 | `-t, --max-tokens` | Max output tokens (default: 16384) |
 | `-r, --request` | Full request body JSON file (`@file.json`) |
 | `-J, --json-output` | Output raw API response JSON |
 | `-L, --login` | Authenticate with Claude (OAuth) |
+| `--cache` | Add prompt-cache breakpoints (append-only conversations) |
 | `--verbose` | Verbose output (show debug info) |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
+
+## Prompt Caching
+
+`--cache` opts into Anthropic prompt caching for **append-only** conversations —
+a single transcript that only ever grows, e.g. driving a turn-by-turn dialogue
+where each turn appends to the message list. It adds `cache_control` breakpoints
+to the last system block and the last message, so each turn reads the prior
+history at the cache-read rate and pays full price only for the new turn (the
+cache extends incrementally rather than being rebuilt).
+
+```bash
+# Each turn: pass the growing transcript with --cache
+./claude-c -p --cache -s "$(cat sys.md)" -m @conversation.json --json-output
+```
+
+Confirm it's working via the response `usage`: `cache_creation_input_tokens` on
+the first turn, then `cache_read_input_tokens > 0` on later turns.
+
+Notes:
+- Uses `{"type":"ephemeral"}` (5-minute TTL, no beta) — works on first-party,
+  Bedrock, and Vertex. String message content is promoted to a text block so the
+  marker can attach.
+- Append-only only. If you mutate a message already in the history (e.g. inject
+  a drifting appendage mid-conversation), the cache breaks from that point —
+  handling that would need a stable-prefix breakpoint, which is not implemented.
+- Ignored in raw request mode (`-r`): supply your own `cache_control` there.
 
 ## Raw Request Mode
 

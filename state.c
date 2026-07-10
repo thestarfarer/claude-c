@@ -318,14 +318,13 @@ int state_fetch_profile(state_t* state, const char* access_token) {
     response_t resp = {NULL, 0};
     struct curl_slist* headers = NULL;
 
-    /* Build auth header */
+    /* Build headers to match official CLI profile fetch (WXe):
+     * Bearer + Content-Type + Cache-Control, NO anthropic-beta */
     char auth_header[512];
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", access_token);
     headers = curl_slist_append(headers, auth_header);
-
-    char beta_header[64];
-    snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", OAUTH_BETA);
-    headers = curl_slist_append(headers, beta_header);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Cache-Control: no-cache");
 
     curl_easy_setopt(curl, CURLOPT_URL, PROFILE_URL);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);

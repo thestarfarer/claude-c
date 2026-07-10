@@ -16,22 +16,26 @@ extern int verbose;
 #define API_MESSAGES_PATH "/v1/messages"
 #define API_VERSION "2023-06-01"
 #define OAUTH_BETA "oauth-2025-04-20"
-#define USER_AGENT "claude-cli/2.1.89 (external, cli)"
+#define CLAUDE_CODE_BETA "claude-code-20250219"
+/* Beta header sent on /v1/messages OAuth requests (matches official CLI) */
+#define MESSAGES_BETA OAUTH_BETA "," CLAUDE_CODE_BETA
+#define USER_AGENT "claude-cli/2.1.206 (external, cli)"
 
 /* Identity strings - must match server whitelist exactly */
 #define IDENTITY_AGENT "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 #define IDENTITY_CLI "You are Claude Code, Anthropic's official CLI for Claude."
 
 /* Default settings */
-#define DEFAULT_MODEL "claude-sonnet-4-5-20250929"
+#define DEFAULT_MODEL "claude-opus-4-8"
 #define DEFAULT_MAX_TOKENS 16384
 
 /* Send a message to the Claude API
- * - model: Model ID (e.g., "claude-sonnet-4-5-20250929")
+ * - model: Model ID (e.g., "claude-opus-4-8")
  * - system_prompt: Custom system prompt (can be NULL)
  * - messages_json: Messages array as JSON string
  * - max_tokens: Maximum output tokens
  * - stream: If non-zero, use streaming mode
+ * - cache: If non-zero, add prompt-cache breakpoints (append-only convos)
  * - output: Stream text output to this file (usually stdout)
  *
  * Returns 0 on success, non-zero on error
@@ -42,6 +46,7 @@ int api_send_message(
     const char* messages_json,
     int max_tokens,
     int stream,
+    int cache,
     FILE* output
 );
 

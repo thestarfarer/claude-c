@@ -370,3 +370,101 @@ char* json_escape_string(const char* str) {
 
     return result;
 }
+
+/* Add cache_control to the last content block of the last message.
+ * Mechanics: locate the messages array, walk to the last element with the
+ * depth-aware skip_value(), find its "content", then either splice the field
+ * into the last block of an array, or promote a bare string to a text block.
+ * The already-escaped message text is reused verbatim. Returns NULL (caller
+ * keeps the original) on anything unexpected. See build_request_body() in
+ * api.c for why this is placed here and how the caching model works. */
+static const char CACHE_CONTROL_FIELD[] = ",\"cache_control\":{\"type\":\"ephemeral\"}";
+
+char* json_add_cache_control_last_message(const char* messages_json) {
+    if (!messages_json) return NULL;
+
+    /* Locate the messages array: a bare array, or an object with "messages". */
+    const char* p = skip_ws(messages_json);
+    const char* arr = NULL;
+    if (*p == '[') {
+        arr = p;
+    } else if (*p == '{') {
+        const char* v = find_key(messages_json, "messages");
+        if (!v) return NULL;
+        v = skip_ws(v);
+        if (*v != '[') return NULL;
+        arr = v;
+    } else {
+        return NULL;
+    }
+
+    /* Walk to the last array element (the last message object). */
+    const char* last_start = NULL;
+    const char* last_end = NULL;
+    p = arr + 1;
+    for (;;) {
+        p = skip_ws(p);
+        if (*p == ']' || *p == '\0') break;
+        const char* es = p;
+        const char* ee = skip_value(p);
+        if (ee <= es) return NULL;
+        last_start = es;
+        last_end = ee;
+        p = skip_ws(ee);
+        if (*p == ',') p++;
+    }
+    (void)last_end;
+    if (!last_start || *last_start != '{') return NULL;
+
+    /* Find the last message's "content" value. */
+    const char* content = find_key(last_start, "content");
+    if (!content) return NULL;
+    content = skip_ws(content);
+
+    size_t in_len = strlen(messages_json);
+    char* out = malloc(in_len + 128);
+    if (!out) return NULL;
+    size_t o = 0;
+
+    if (*content == '[') {
+        /* Array content: splice cache_control into the last block object. */
+        const char* blk_end = NULL;
+        const char* cp = content + 1;
+        for (;;) {
+            cp = skip_ws(cp);
+            if (*cp == ']' || *cp == '\0') break;
+            const char* bs = cp;
+            const char* be = skip_value(cp);
+            if (be <= bs) { free(out); return NULL; }
+            blk_end = be;
+            cp = skip_ws(be);
+            if (*cp == ',') cp++;
+        }
+        if (!blk_end || *(blk_end - 1) != '}') { free(out); return NULL; }
+        size_t head = (size_t)((blk_end - 1) - messages_json);  /* up to last '}' */
+        memcpy(out + o, messages_json, head); o += head;
+        size_t cclen = sizeof(CACHE_CONTROL_FIELD) - 1;
+        memcpy(out + o, CACHE_CONTROL_FIELD, cclen); o += cclen;
+        memcpy(out + o, messages_json + head, in_len - head); o += in_len - head;
+    } else if (*content == '"') {
+        /* String content: promote to a one-element text block carrying cache_control. */
+        const char* str_end = skip_value(content);   /* one past closing '"' */
+        if (str_end <= content) { free(out); return NULL; }
+        static const char OPEN[]  = "[{\"type\":\"text\",\"text\":";
+        static const char CLOSE[] = ",\"cache_control\":{\"type\":\"ephemeral\"}}]";
+        size_t head = (size_t)(content - messages_json);
+        size_t slit = (size_t)(str_end - content);          /* the "..." literal */
+        memcpy(out + o, messages_json, head); o += head;
+        memcpy(out + o, OPEN, sizeof(OPEN) - 1); o += sizeof(OPEN) - 1;
+        memcpy(out + o, content, slit); o += slit;
+        memcpy(out + o, CLOSE, sizeof(CLOSE) - 1); o += sizeof(CLOSE) - 1;
+        size_t tail_off = (size_t)(str_end - messages_json);
+        memcpy(out + o, str_end, in_len - tail_off); o += in_len - tail_off;
+    } else {
+        free(out);
+        return NULL;
+    }
+
+    out[o] = '\0';
+    return out;
+}

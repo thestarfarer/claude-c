@@ -12,10 +12,67 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/utsname.h>
 
 /* Billing header constants */
 #define BILLING_SALT "59cf53e54c78"
-#define BILLING_VERSION "2.1.89"
+#define BILLING_VERSION "2.1.206"
+
+/* X-Stainless-* telemetry headers sent by the official SDK on /v1/messages.
+ * Static values mirror the bundled Anthropic SDK (v0.94.0); OS/Arch are
+ * derived from uname() the way the SDK maps process.platform/process.arch.
+ * NOTE: the SDK reports Runtime "node" even under Bun (Bun isn't detected). */
+#define STAINLESS_LANG "js"
+#define STAINLESS_PKG_VERSION "0.94.0"
+#define STAINLESS_RUNTIME "node"
+#define STAINLESS_RUNTIME_VERSION "v24.9.0"
+#define STAINLESS_RETRY_COUNT "0"   /* claude-c does not auto-retry */
+#define STAINLESS_TIMEOUT "600"     /* matches the 600s curl timeout below */
+
+/* Map uname sysname -> SDK X-Stainless-OS value */
+static const char* stainless_os(const char* sysname) {
+    if (!sysname) return "Unknown";
+    if (strcmp(sysname, "Linux") == 0) return "Linux";
+    if (strcmp(sysname, "Darwin") == 0) return "MacOS";
+    if (strncmp(sysname, "CYGWIN", 6) == 0 ||
+        strncmp(sysname, "MINGW", 5) == 0 ||
+        strncmp(sysname, "MSYS", 4) == 0) return "Windows";
+    if (strcmp(sysname, "FreeBSD") == 0) return "FreeBSD";
+    if (strcmp(sysname, "OpenBSD") == 0) return "OpenBSD";
+    return sysname;
+}
+
+/* Map uname machine -> SDK X-Stainless-Arch value */
+static const char* stainless_arch(const char* machine) {
+    if (!machine) return "unknown";
+    if (strcmp(machine, "x86_64") == 0 || strcmp(machine, "amd64") == 0) return "x64";
+    if (strcmp(machine, "aarch64") == 0 || strcmp(machine, "arm64") == 0) return "arm64";
+    if (strcmp(machine, "i386") == 0 || strcmp(machine, "i686") == 0) return "x32";
+    return machine;
+}
+
+/* Append the SDK's X-Stainless-* telemetry headers (only for /v1/messages) */
+static struct curl_slist* append_stainless_headers(struct curl_slist* headers) {
+    struct utsname u;
+    const char* os = "Linux";
+    const char* arch = "x64";
+    if (uname(&u) == 0) {
+        os = stainless_os(u.sysname);
+        arch = stainless_arch(u.machine);
+    }
+    char buf[128];
+    headers = curl_slist_append(headers, "X-Stainless-Lang: " STAINLESS_LANG);
+    headers = curl_slist_append(headers, "X-Stainless-Package-Version: " STAINLESS_PKG_VERSION);
+    headers = curl_slist_append(headers, "X-Stainless-Runtime: " STAINLESS_RUNTIME);
+    headers = curl_slist_append(headers, "X-Stainless-Runtime-Version: " STAINLESS_RUNTIME_VERSION);
+    headers = curl_slist_append(headers, "X-Stainless-Retry-Count: " STAINLESS_RETRY_COUNT);
+    headers = curl_slist_append(headers, "X-Stainless-Timeout: " STAINLESS_TIMEOUT);
+    snprintf(buf, sizeof(buf), "X-Stainless-OS: %s", os);
+    headers = curl_slist_append(headers, buf);
+    snprintf(buf, sizeof(buf), "X-Stainless-Arch: %s", arch);
+    headers = curl_slist_append(headers, buf);
+    return headers;
+}
 
 /* Context for streaming curl callbacks */
 typedef struct {
@@ -83,7 +140,7 @@ static size_t buffer_write_callback(char* ptr, size_t size, size_t nmemb, void* 
 
 /* Compute billing header string from first user message text.
  * Returns allocated string like:
- *   x-anthropic-billing-header: cc_version=2.1.39.abc; cc_entrypoint=cli; cch=00000;
+ *   x-anthropic-billing-header: cc_version=2.1.206.abc; cc_entrypoint=cli; cch=00000;
  * Caller must free(). Returns NULL on failure.
  */
 static char* compute_billing_header(const char* first_user_text) {
@@ -119,9 +176,35 @@ static char* compute_billing_header(const char* first_user_text) {
 }
 
 /* Build request body JSON */
+/* Prompt caching (opt-in via --cache) -- how it works.
+ *
+ * Anthropic prompt caching is an ABSOLUTE PREFIX cache: a "cache_control"
+ * breakpoint caches everything from the start of the request up to that block,
+ * and a later request gets a HIT only if that whole prefix is byte-for-byte
+ * identical to the cached one. When `cache` is set we place two breakpoints:
+ *   1. the LAST block of the system array (below), and
+ *   2. the last content block of the last message (json_add_cache_control_last_message).
+ *
+ * For an APPEND-ONLY conversation -- one transcript that only ever grows, e.g.
+ * two agents talking turn by turn -- each turn's prefix (system + full history)
+ * is a superset of the previous turn's. So the server reads the old prefix
+ * cheaply (usage.cache_read_input_tokens) and writes only the new delta
+ * (usage.cache_creation_input_tokens): the cache extends incrementally instead
+ * of being rebuilt each turn. The billing block is deliberately kept FIRST and
+ * uncached -- it is derived from the first user message, so it is stable within
+ * a conversation and never invalidates the prefix. TTL is a 5-minute sliding
+ * window, refreshed on every hit; we use {type:"ephemeral"} with no ttl/scope,
+ * so no beta header is needed and it works on first-party, Bedrock, and Vertex.
+ *
+ * SCOPE: this is the append-only (Case A) variant ONLY. If a message already
+ * inside the cached prefix is mutated (e.g. a drifting appendage injected at a
+ * fixed depth-from-end), the prefix diverges there and caching breaks
+ * downstream -- covering that needs a second "stable prefix" breakpoint (what
+ * Claude Code's ZRy does) and is intentionally NOT implemented here.
+ */
 static char* build_request_body(const char* model, const char* system_prompt,
                                  const char* messages_json, int max_tokens,
-                                 int stream, const char* metadata_user_id,
+                                 int stream, int cache, const char* metadata_user_id,
                                  const char* first_user_text) {
     /* Escape system prompt if provided */
     char* escaped_prompt = NULL;
@@ -142,9 +225,20 @@ static char* build_request_body(const char* model, const char* system_prompt,
         billing = NULL;
     }
 
+    /* Prompt caching: add cache_control to the last message (breakpoint #2) and
+       to the last system block below (breakpoint #1). On any messages-parse
+       failure, cached_messages is NULL and we fall back to the original. */
+    char* cached_messages = NULL;
+    if (cache && messages_json) {
+        cached_messages = json_add_cache_control_last_message(messages_json);
+    }
+    const char* messages_out = cached_messages ? cached_messages
+                             : (messages_json ? messages_json : "[]");
+    const char* cache_cc = cache ? ",\"cache_control\":{\"type\":\"ephemeral\"}" : "";
+
     /* Calculate buffer size (generous) */
     size_t prompt_len = escaped_prompt ? strlen(escaped_prompt) : 0;
-    size_t messages_len = messages_json ? strlen(messages_json) : 2;
+    size_t messages_len = strlen(messages_out);
     size_t metadata_len = metadata_user_id ? strlen(metadata_user_id) : 8;
     size_t billing_len = strlen(billing_block);
     size_t buf_size = 2048 + prompt_len + messages_len + metadata_len + billing_len;
@@ -152,13 +246,15 @@ static char* build_request_body(const char* model, const char* system_prompt,
     char* body = malloc(buf_size);
     if (!body) {
         free(escaped_prompt);
+        free(cached_messages);
         return NULL;
     }
 
     const char* stream_str = stream ? "true" : "false";
     const char* user_id = metadata_user_id ? metadata_user_id : "claude-c";
 
-    /* Build JSON - billing header first, then identity, then user prompt */
+    /* Build JSON - billing header first, then identity, then user prompt.
+       The last system block carries cache_cc (empty unless --cache). */
     if (escaped_prompt) {
         snprintf(body, buf_size,
             "{"
@@ -168,7 +264,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
             "\"system\":["
                 "%s"
                 "{\"type\":\"text\",\"text\":\"%s\"},"
-                "{\"type\":\"text\",\"text\":\"%s\"}"
+                "{\"type\":\"text\",\"text\":\"%s\"%s}"
             "],"
             "\"messages\":%s,"
             "\"metadata\":{\"user_id\":\"%s\"}"
@@ -179,7 +275,8 @@ static char* build_request_body(const char* model, const char* system_prompt,
             billing_block,
             IDENTITY_AGENT,
             escaped_prompt,
-            messages_json ? messages_json : "[]",
+            cache_cc,
+            messages_out,
             user_id
         );
         free(escaped_prompt);
@@ -191,7 +288,7 @@ static char* build_request_body(const char* model, const char* system_prompt,
             "\"stream\":%s,"
             "\"system\":["
                 "%s"
-                "{\"type\":\"text\",\"text\":\"%s\"}"
+                "{\"type\":\"text\",\"text\":\"%s\"%s}"
             "],"
             "\"messages\":%s,"
             "\"metadata\":{\"user_id\":\"%s\"}"
@@ -201,11 +298,13 @@ static char* build_request_body(const char* model, const char* system_prompt,
             stream_str,
             billing_block,
             IDENTITY_AGENT,
-            messages_json ? messages_json : "[]",
+            cache_cc,
+            messages_out,
             user_id
         );
     }
 
+    free(cached_messages);
     return body;
 }
 
@@ -299,7 +398,7 @@ static char* extract_response_text(const char* json) {
 
 int api_send_message(const char* model, const char* system_prompt,
                      const char* messages_json, int max_tokens,
-                     int stream, FILE* output) {
+                     int stream, int cache, FILE* output) {
     int result = 1;
     CURL* curl = NULL;
     struct curl_slist* headers = NULL;
@@ -367,6 +466,10 @@ int api_send_message(const char* model, const char* system_prompt,
 
     /* Build headers */
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    /* Accept: SSE when streaming, JSON otherwise (matches official SDK) */
+    headers = curl_slist_append(headers,
+        stream ? "Accept: text/event-stream" : "Accept: application/json");
+    headers = append_stainless_headers(headers);
 
     char version_header[64];
     snprintf(version_header, sizeof(version_header), "anthropic-version: %s", API_VERSION);
@@ -395,7 +498,7 @@ int api_send_message(const char* model, const char* system_prompt,
         headers = curl_slist_append(headers, auth_header);
 
         char beta_header[64];
-        snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", OAUTH_BETA);
+        snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", MESSAGES_BETA);
         headers = curl_slist_append(headers, beta_header);
     }
 
@@ -409,6 +512,7 @@ int api_send_message(const char* model, const char* system_prompt,
         messages_json,
         max_tokens > 0 ? max_tokens : DEFAULT_MAX_TOKENS,
         stream,
+        cache,
         metadata_user_id,
         first_user_text
     );
@@ -418,6 +522,8 @@ int api_send_message(const char* model, const char* system_prompt,
         fprintf(stderr, "Error: Failed to build request body\n");
         goto cleanup;
     }
+
+    DEBUG("Request body: %s\n", body);
 
     /* Configure curl */
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -727,6 +833,9 @@ int api_send_raw_request(const char* request_body, int json_output, FILE* output
 
     /* Build headers */
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    /* Raw request mode is always non-streaming */
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = append_stainless_headers(headers);
 
     char version_header[64];
     snprintf(version_header, sizeof(version_header), "anthropic-version: %s", API_VERSION);
@@ -755,7 +864,7 @@ int api_send_raw_request(const char* request_body, int json_output, FILE* output
         headers = curl_slist_append(headers, auth_header);
 
         char beta_header[64];
-        snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", OAUTH_BETA);
+        snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", MESSAGES_BETA);
         headers = curl_slist_append(headers, beta_header);
     }
 

@@ -177,6 +177,16 @@ state_t state_load(void) {
     }
     if (need_save) state_save(&state);
 
+    /* Per-invocation session_id override (env). Applied AFTER save so the
+     * shared state file keeps its own persistent session_id; this only sets
+     * the session_id sent in metadata for this process. Lets a caller give
+     * each logical chat a stable, distinct session_id without touching disk. */
+    const char* env_session = getenv("CLAUDE_C_SESSION_ID");
+    if (env_session && *env_session) {
+        free(state.session_id);
+        state.session_id = strdup(env_session);
+    }
+
     free(path);
     return state;
 }

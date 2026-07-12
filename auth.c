@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <curl/curl.h>
@@ -91,6 +93,35 @@ static char* get_state_path(void) {
 
     snprintf(path, len, "%s/%s", home, CLAUDE_C_STATE_FILE);
     return path;
+}
+
+/* Acquire an exclusive advisory lock serializing token refresh across
+ * concurrent claude-c processes. Refresh tokens are single-use (rotated on
+ * every refresh), so parallel refreshes race: the first wins, the rest hold a
+ * dead refresh token and fail with invalid_grant. Lock lives on a SEPARATE
+ * file (the state file itself is rewritten in place by saves). The kernel
+ * releases flocks on process death, so a crash can never wedge the lock.
+ * Returns fd >= 0 on success (caller must refresh_unlock), -1 if unavailable
+ * (caller proceeds unlocked — worst case is the old racy behavior). */
+static int refresh_lock(void) {
+    const char* home = getenv("HOME");
+    if (!home) return -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.claude/claude-c.lock", home);
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void refresh_unlock(int fd) {
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+    }
 }
 
 /* Get Claude Code credentials file path */
@@ -455,14 +486,31 @@ auth_t auth_load(void) {
         return auth;
     }
 
-    /* Check if token needs refresh */
+    /* Check if token needs refresh. Serialized under an advisory lock with a
+     * double-check re-read: while we waited for the lock, a sibling process
+     * may already have refreshed and rotated the (single-use) refresh token —
+     * in that case the re-read hands us the fresh credentials and we skip. */
     if (creds->refresh_token && oauth_needs_refresh(creds->expires_at)) {
-        DEBUG("OAuth token expired or expiring soon, refreshing...\n");
-        if (oauth_refresh(creds) != 0) {
-            fprintf(stderr, "Token refresh failed. Try running 'claude' to re-authenticate.\n");
-            oauth_creds_free(creds);
+        int lockfd = refresh_lock();
+
+        oauth_creds_free(creds);
+        creds = oauth_load();
+        if (!creds) {
+            refresh_unlock(lockfd);
+            fprintf(stderr, "Credentials vanished during refresh lock.\n");
             return auth;
         }
+
+        if (creds->refresh_token && oauth_needs_refresh(creds->expires_at)) {
+            DEBUG("OAuth token expired or expiring soon, refreshing...\n");
+            if (oauth_refresh(creds) != 0) {
+                refresh_unlock(lockfd);
+                fprintf(stderr, "Token refresh failed. Try running 'claude' to re-authenticate.\n");
+                oauth_creds_free(creds);
+                return auth;
+            }
+        }
+        refresh_unlock(lockfd);
     }
 
     auth.type = AUTH_OAUTH;

@@ -95,15 +95,28 @@ static char* get_state_path(void) {
     return path;
 }
 
-/* Acquire an exclusive advisory lock serializing token refresh across
- * concurrent claude-c processes. Refresh tokens are single-use (rotated on
- * every refresh), so parallel refreshes race: the first wins, the rest hold a
- * dead refresh token and fail with invalid_grant. Lock lives on a SEPARATE
- * file (the state file itself is rewritten in place by saves). The kernel
- * releases flocks on process death, so a crash can never wedge the lock.
- * Returns fd >= 0 on success (caller must refresh_unlock), -1 if unavailable
- * (caller proceeds unlocked — worst case is the old racy behavior). */
-static int refresh_lock(void) {
+/* Exclusive advisory lock serializing EVERY reader-modify-writer of the
+ * shared state file (~/.claude/claude-c.json) across concurrent claude-c
+ * processes: token refresh (single-use refresh tokens race), oauth_save and
+ * state_save (both read-modify-write the same file and can resurrect stale
+ * fields over a sibling's fresh write). Lock lives on a SEPARATE file — the
+ * state file itself is replaced by rename(). The kernel releases flocks on
+ * process death, so a crash can never wedge the lock.
+ *
+ * Re-entrant within a process (claude-c is single-threaded): the refresh path
+ * holds the lock while oauth_refresh -> oauth_save runs, which locks again.
+ * flock would deadlock on a second fd in the same process, so a depth counter
+ * short-circuits nested acquisitions.
+ * Returns 0 on success (caller MUST claudec_unlockfile()), -1 if unavailable
+ * (caller proceeds unlocked — degrades to the old racy behavior). */
+static int g_lock_fd = -1;
+static int g_lock_depth = 0;
+
+int claudec_lockfile(void) {
+    if (g_lock_depth > 0) {
+        g_lock_depth++;
+        return 0;
+    }
     const char* home = getenv("HOME");
     if (!home) return -1;
     char path[512];
@@ -114,14 +127,22 @@ static int refresh_lock(void) {
         close(fd);
         return -1;
     }
-    return fd;
+    g_lock_fd = fd;
+    g_lock_depth = 1;
+    return 0;
 }
 
-static void refresh_unlock(int fd) {
-    if (fd >= 0) {
-        flock(fd, LOCK_UN);
-        close(fd);
+void claudec_unlockfile(void) {
+    if (g_lock_depth > 1) {
+        g_lock_depth--;
+        return;
     }
+    if (g_lock_depth == 1 && g_lock_fd >= 0) {
+        flock(g_lock_fd, LOCK_UN);
+        close(g_lock_fd);
+        g_lock_fd = -1;
+    }
+    g_lock_depth = 0;
 }
 
 /* Get Claude Code credentials file path */
@@ -238,7 +259,11 @@ oauth_creds_t* oauth_load(void) {
     return creds;
 }
 
-/* Save OAuth credentials to claude-c storage */
+/* Save OAuth credentials to claude-c storage.
+ * Serialized under the shared writer lock; preserves ALL non-oauth state
+ * fields (userId, accountUuid, sessionId — dropping sessionId here is how
+ * credentials got mangled once); writes atomically via tmp+rename so a
+ * concurrent reader can never see a torn/partial file. */
 int oauth_save(const oauth_creds_t* creds) {
     if (!creds || !creds->access_token) return -1;
 
@@ -247,22 +272,30 @@ int oauth_save(const oauth_creds_t* creds) {
 
     ensure_dir(path);
 
-    /* Read existing state */
+    int locked = claudec_lockfile();
+
+    /* Read existing state (under lock, so it cannot be mid-rewrite) */
     char* existing = read_file(path);
     char* user_id = NULL;
     char* account_uuid = NULL;
+    char* session_id = NULL;
 
     if (existing) {
         user_id = json_get_string(existing, "userId");
         account_uuid = json_get_string(existing, "accountUuid");
+        session_id = json_get_string(existing, "sessionId");
         free(existing);
     }
 
-    FILE* f = fopen(path, "w");
-    free(path);
+    char tmp_path[600];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE* f = fopen(tmp_path, "w");
     if (!f) {
+        if (locked == 0) claudec_unlockfile();
+        free(path);
         free(user_id);
         free(account_uuid);
+        free(session_id);
         return -1;
     }
 
@@ -276,6 +309,11 @@ int oauth_save(const oauth_creds_t* creds) {
     if (account_uuid) {
         fprintf(f, "  \"accountUuid\": \"%s\",\n", account_uuid);
         free(account_uuid);
+    }
+
+    if (session_id) {
+        fprintf(f, "  \"sessionId\": \"%s\",\n", session_id);
+        free(session_id);
     }
 
     fprintf(f, "  \"oauth\": {\n");
@@ -297,6 +335,10 @@ int oauth_save(const oauth_creds_t* creds) {
     fprintf(f, "}\n");
 
     fclose(f);
+    int rc = rename(tmp_path, path);
+    if (locked == 0) claudec_unlockfile();
+    free(path);
+    if (rc != 0) return -1;
     return 0;
 }
 
@@ -472,9 +514,16 @@ auth_t auth_load(void) {
     /* Priority 2: OAuth from claude-c storage */
     oauth_creds_t* creds = oauth_load();
 
-    /* Priority 3: Migrate from Claude Code on first run */
+    /* Priority 3: Migrate from Claude Code — ONLY on genuine first run (state
+     * file absent). Migrating whenever oauth_load returns NULL is dangerous:
+     * a transiently unreadable state file would resurrect Claude Code's stale
+     * tokens over live ones (this happened; the stale refresh token then
+     * fails invalid_grant forever). */
     if (!creds) {
-        if (oauth_migrate_from_claude_code() == 0) {
+        char* sp = get_state_path();
+        int missing = (!sp || access(sp, F_OK) != 0);
+        free(sp);
+        if (missing && oauth_migrate_from_claude_code() == 0) {
             creds = oauth_load();
         }
     }
@@ -491,12 +540,12 @@ auth_t auth_load(void) {
      * may already have refreshed and rotated the (single-use) refresh token —
      * in that case the re-read hands us the fresh credentials and we skip. */
     if (creds->refresh_token && oauth_needs_refresh(creds->expires_at)) {
-        int lockfd = refresh_lock();
+        int locked = claudec_lockfile();
 
         oauth_creds_free(creds);
         creds = oauth_load();
         if (!creds) {
-            refresh_unlock(lockfd);
+            if (locked == 0) claudec_unlockfile();
             fprintf(stderr, "Credentials vanished during refresh lock.\n");
             return auth;
         }
@@ -504,13 +553,13 @@ auth_t auth_load(void) {
         if (creds->refresh_token && oauth_needs_refresh(creds->expires_at)) {
             DEBUG("OAuth token expired or expiring soon, refreshing...\n");
             if (oauth_refresh(creds) != 0) {
-                refresh_unlock(lockfd);
+                if (locked == 0) claudec_unlockfile();
                 fprintf(stderr, "Token refresh failed. Try running 'claude' to re-authenticate.\n");
                 oauth_creds_free(creds);
                 return auth;
             }
         }
-        refresh_unlock(lockfd);
+        if (locked == 0) claudec_unlockfile();
     }
 
     auth.type = AUTH_OAUTH;

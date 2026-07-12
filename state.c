@@ -4,6 +4,7 @@
 
 #include "state.h"
 #include "json.h"
+#include "auth.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -197,29 +198,37 @@ int state_save(const state_t* state) {
 
     ensure_dir(path);
 
-    /* Read existing file to preserve oauth credentials */
+    /* Serialize with all other state-file writers; read-modify-write below.
+     * oauth.expiresAt is a NUMBER — reading it with json_get_string returned
+     * NULL and silently DROPPED the expiry on every state_save (which then
+     * made auth_load treat the token as always-expired). Preserve numerically. */
+    int locked = claudec_lockfile();
+
     char* existing = read_file(path);
     char* oauth_access = NULL;
     char* oauth_refresh = NULL;
     char* oauth_scopes = NULL;
-    char* oauth_expires = NULL;
+    long long oauth_expires = 0;
+    int found_expires = 0;
 
     if (existing) {
         oauth_access = json_get_string(existing, "oauth.accessToken");
         oauth_refresh = json_get_string(existing, "oauth.refreshToken");
         oauth_scopes = json_get_string(existing, "oauth.scopes");
-        oauth_expires = json_get_string(existing, "oauth.expiresAt");
+        oauth_expires = json_get_number(existing, "oauth.expiresAt", &found_expires);
         free(existing);
     }
 
-    FILE* f = fopen(path, "w");
-    free(path);
+    char tmp_path[600];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE* f = fopen(tmp_path, "w");
 
     if (!f) {
+        if (locked == 0) claudec_unlockfile();
+        free(path);
         free(oauth_access);
         free(oauth_refresh);
         free(oauth_scopes);
-        free(oauth_expires);
         return -1;
     }
 
@@ -253,8 +262,8 @@ int state_save(const state_t* state) {
         if (oauth_refresh) {
             fprintf(f, ",\n    \"refreshToken\": \"%s\"", oauth_refresh);
         }
-        if (oauth_expires) {
-            fprintf(f, ",\n    \"expiresAt\": %s", oauth_expires);
+        if (found_expires) {
+            fprintf(f, ",\n    \"expiresAt\": %lld", oauth_expires);
         }
         if (oauth_scopes) {
             fprintf(f, ",\n    \"scopes\": \"%s\"", oauth_scopes);
@@ -267,12 +276,16 @@ int state_save(const state_t* state) {
 
     fclose(f);
 
+    /* Atomic replace: readers can never observe a torn/partial state file. */
+    int rc = rename(tmp_path, path);
+    if (locked == 0) claudec_unlockfile();
+    free(path);
+
     free(oauth_access);
     free(oauth_refresh);
     free(oauth_scopes);
-    free(oauth_expires);
 
-    return 0;
+    return rc == 0 ? 0 : -1;
 }
 
 void state_free(state_t* state) {

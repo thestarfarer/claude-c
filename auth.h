@@ -83,4 +83,11 @@ void oauth_creds_free(oauth_creds_t* creds);
  */
 int oauth_migrate_from_claude_code(void);
 
+/* Shared writer lock for ~/.claude/claude-c.json (re-entrant per process).
+ * MUST be held around any read-modify-write of the state file.
+ * claudec_lockfile returns 0 when the lock was acquired (or re-entered);
+ * -1 when unavailable (caller proceeds unlocked). Balance with unlockfile. */
+int claudec_lockfile(void);
+void claudec_unlockfile(void);
+
 #endif /* AUTH_H */

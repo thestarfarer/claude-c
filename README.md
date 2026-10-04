@@ -2,6 +2,37 @@
 
 Minimal Claude Code API client in C.
 
+## Protocol compatibility
+
+Uses the Claude Code **2.1.281** protocol update from the SillyTavern
+`starfarer-patches` branch (bundled Anthropic SDK **0.112.1**).
+
+- OAuth Messages requests use `/v1/messages?beta=true`, the current CLI/billing
+  version, request/session IDs, SDK headers, and
+  `anthropic-dangerous-direct-browser-access: true` (also sent by the official
+  server-side SDK client; this does not make a browser request).
+- OAuth and Claude Code beta headers are separate; Haiku omits the Claude Code
+  beta. `Accept` is `application/json`, including streamed requests, as in Tavern.
+- Login/refresh include `user:plugins`. Refresh preserves granted project scopes
+  and custom client IDs, falls back to the original grant only on `invalid_scope`,
+  and retains refresh-token expiry. Existing accounts do not need to log in again
+  solely for this update.
+- A rejected OAuth access token gets one recovery attempt: reuse a token another
+  process refreshed, or refresh under the shared credential lock, then resend
+  once. Successful streams and other HTTP failures are never replayed.
+- Newer models default to adaptive thinking. Adaptive-only models (including
+  Opus 5.5) convert legacy enabled/disabled thinking to adaptive. In raw mode,
+  explicit supported thinking settings and `output_config` are retained;
+  incompatible sampling fields are removed, forced tool choice becomes `auto`
+  while thinking, and a trailing assistant prefill becomes a user message.
+- Raw `output_config.effort: "xhigh"` is supported on capable models and falls
+  back to `high` on older ones. Effort, thinking, and JSON-schema beta headers
+  follow the request. Raw mode remains buffered (`stream: false`).
+
+The default model remains `claude-opus-4-8`. Select Opus 5.5 with
+`--model claude-opus-5-5`; no separate model allowlist is used.
+Token and profile endpoints already matched this update and remain unchanged.
+
 ## Build
 
 ```bash
@@ -127,7 +158,8 @@ The `-J` option outputs the raw API response JSON instead of extracting text.
 
 ### Request Body
 
-Sent to `POST https://api.anthropic.com/v1/messages`:
+OAuth requests are sent to `POST https://api.anthropic.com/v1/messages?beta=true`
+(API-key requests omit the query):
 
 ```json
 {
@@ -143,7 +175,7 @@ Sent to `POST https://api.anthropic.com/v1/messages`:
     {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
     {"role": "user", "content": "How are you?"}
   ],
-  "metadata": {"user_id": "user_{64hex}_account_{uuid}_session_{uuid}"}
+  "metadata": {"user_id": "{\"device_id\":\"64hex\",\"account_uuid\":\"uuid\",\"session_id\":\"uuid\"}"}
 }
 ```
 

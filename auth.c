@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <curl/curl.h>
+#include <limits.h>
 
 /* Storage paths */
 #define CLAUDE_C_STATE_FILE ".claude/claude-c.json"
@@ -222,6 +223,7 @@ void oauth_creds_free(oauth_creds_t* creds) {
         free(creds->refresh_token);
     }
     free(creds->scopes);
+    free(creds->client_id);
     free(creds);
 }
 
@@ -250,7 +252,9 @@ oauth_creds_t* oauth_load(void) {
 
     creds->access_token = access_token;
     creds->refresh_token = json_get_string(content, "oauth.refreshToken");
-    creds->scopes = json_get_string(content, "oauth.scopes");
+    creds->scopes = json_get_scopes(content, "oauth.scopes");
+    creds->client_id = json_get_string(content, "oauth.clientId");
+    creds->refresh_expires_at = json_get_number(content, "oauth.refreshTokenExpiresAt", NULL);
 
     int found_expires = 0;
     creds->expires_at = json_get_number(content, "oauth.expiresAt", &found_expires);
@@ -331,6 +335,12 @@ int oauth_save(const oauth_creds_t* creds) {
         fprintf(f, ",\n    \"scopes\": \"%s\"", creds->scopes);
     }
 
+    if (creds->client_id) {
+        fprintf(f, ",\n    \"clientId\": \"%s\"", creds->client_id);
+    }
+    if (creds->refresh_expires_at > 0) {
+        fprintf(f, ",\n    \"refreshTokenExpiresAt\": %lld", creds->refresh_expires_at);
+    }
     fprintf(f, "\n  }\n");
     fprintf(f, "}\n");
 
@@ -363,95 +373,132 @@ static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdat
     return bytes;
 }
 
-/* Refresh OAuth token */
+/* Match whole scope names, not substrings. */
+static int has_scope(const char* scopes, const char* scope) {
+    if (!scopes) return 0;
+    size_t n = strlen(scope);
+    const char* p = scopes;
+    while ((p = strstr(p, scope))) {
+        if ((p == scopes || p[-1] == ' ') && (p[n] == 0 || p[n] == ' ')) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+static char* refresh_scopes(const oauth_creds_t* creds) {
+    if ((creds->client_id && strcmp(creds->client_id, OAUTH_CLIENT_ID) != 0)
+        || (creds->scopes && *creds->scopes && !has_scope(creds->scopes, "user:inference")))
+        return strdup(creds->scopes ? creds->scopes : "");
+    char* scopes = malloc(sizeof(OAUTH_REFRESH_SCOPES) + 64);
+    if (!scopes) return NULL;
+    strcpy(scopes, OAUTH_REFRESH_SCOPES);
+    if (has_scope(creds->scopes, "user:projects:read")) strcat(scopes, " user:projects:read");
+    if (has_scope(creds->scopes, "user:projects:write")) strcat(scopes, " user:projects:write");
+    return scopes;
+}
+
+/* Refresh under the caller's shared writer lock, preserving the original grant
+ * if an older account rejects the expanded 2.1.281 scope list. */
 int oauth_refresh(oauth_creds_t* creds) {
     if (!creds || !creds->refresh_token) return -1;
-
-    CURL* curl = curl_easy_init();
-    if (!curl) return -1;
-
-    response_t resp = {NULL, 0};
-    struct curl_slist* headers = NULL;
-
-    /* Build JSON request body */
-    size_t body_len = 512 + strlen(creds->refresh_token);
-    char* body = malloc(body_len);
-    if (!body) {
-        curl_easy_cleanup(curl);
+    if (creds->refresh_expires_at > 0 && current_time_ms() >= creds->refresh_expires_at) {
+        fprintf(stderr, "Claude refresh token expired. Run './claude-c --login'.\n");
         return -1;
     }
-
-    snprintf(body, body_len,
-        "{\"grant_type\":\"refresh_token\","
-        "\"refresh_token\":\"%s\","
-        "\"client_id\":\"%s\","
-        "\"scope\":\"%s\"}",
-        creds->refresh_token, OAUTH_CLIENT_ID, OAUTH_REFRESH_SCOPES);
-
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
+    char* scopes = refresh_scopes(creds);
+    char* token = json_escape_string(creds->refresh_token);
+    char* client = json_escape_string(creds->client_id ? creds->client_id : OAUTH_CLIENT_ID);
+    CURL* curl = curl_easy_init();
+    if (!scopes || !token || !client || !curl) {
+        free(scopes); free(token); free(client);
+        if (curl) curl_easy_cleanup(curl);
+        return -1;
+    }
+    struct curl_slist* headers = curl_slist_append(NULL, "Content-Type: application/json");
     curl_easy_setopt(curl, CURLOPT_URL, OAUTH_TOKEN_URL);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-
-    CURLcode res = curl_easy_perform(curl);
     int result = -1;
-
-    if (res == CURLE_OK) {
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-        if (http_code == 200 && resp.data) {
-            char* new_access = json_get_string(resp.data, "access_token");
-            char* new_refresh = json_get_string(resp.data, "refresh_token");
-            int found_expires = 0;
-            long long expires_in = json_get_number(resp.data, "expires_in", &found_expires);
-
-            if (new_access) {
-                /* Update credentials */
-                free(creds->access_token);
-                creds->access_token = new_access;
-
-                if (new_refresh) {
-                    free(creds->refresh_token);
-                    creds->refresh_token = new_refresh;
-                }
-
-                if (found_expires && expires_in > 0) {
-                    creds->expires_at = current_time_ms() + (expires_in * 1000);
-                }
-
-                /* Save updated credentials */
-                oauth_save(creds);
-                result = 0;
-
-                DEBUG("OAuth token refreshed successfully\n");
-            } else {
-                free(new_refresh);
-            }
-        } else {
-            fprintf(stderr, "OAuth refresh failed: HTTP %ld\n", http_code);
-            if (resp.data) {
-                char* error = json_get_string(resp.data, "error");
-                char* desc = json_get_string(resp.data, "error_description");
-                if (error) fprintf(stderr, "  Error: %s\n", error);
-                if (desc) fprintf(stderr, "  Description: %s\n", desc);
-                free(error);
-                free(desc);
-            }
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const char* requested = attempt ? creds->scopes : scopes;
+        char* escaped = json_escape_string(requested);
+        if (!escaped) break;
+        size_t len = strlen(token) + strlen(client) + strlen(escaped) + 128;
+        char* body = malloc(len);
+        if (!body) { free(escaped); break; }
+        snprintf(body, len, "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"%s\",\"client_id\":\"%s\",\"scope\":\"%s\"}", token, client, escaped);
+        free(escaped);
+        response_t resp = {0};
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+        CURLcode res = curl_easy_perform(curl);
+        free(body);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "OAuth refresh request failed: %s\n", curl_easy_strerror(res));
+            free(resp.data); break;
         }
-    } else {
-        fprintf(stderr, "OAuth refresh request failed: %s\n", curl_easy_strerror(res));
+        if (status != 200) {
+            int retry = attempt == 0 && creds->scopes && *creds->scopes
+                && strcmp(requested, creds->scopes) != 0
+                && (json_string_equals(resp.data, "error", "invalid_scope")
+                    || json_string_equals(resp.data, "error.type", "invalid_scope"));
+            free(resp.data);
+            if (retry) continue;
+            /* Do not print OAuth error bodies; they can contain credentials. */
+            fprintf(stderr, "OAuth refresh failed: HTTP %ld\n", status);
+            break;
+        }
+        char* access = json_get_string(resp.data, "access_token");
+        char* refresh = json_get_string(resp.data, "refresh_token");
+        char* granted = json_get_string(resp.data, "scope");
+        char* refresh_field = json_get_raw(resp.data, "refresh_token");
+        long long expires = json_get_number(resp.data, "expires_in", NULL);
+        long long refresh_expires = json_get_number(resp.data, "refresh_token_expires_in", NULL);
+        long long now = current_time_ms();
+        int valid = access && *access && !strpbrk(access, "\r\n\"\\")
+            && expires > 0 && expires <= (LLONG_MAX - now) / 1000
+            && (!refresh_field || (refresh && *refresh && !strpbrk(refresh, "\r\n\"\\")));
+        free(refresh_field); free(resp.data);
+        if (!valid) {
+            fprintf(stderr, "Claude OAuth returned invalid refresh credentials.\n");
+            free(access); free(refresh); free(granted); break;
+        }
+        if (!granted) granted = strdup(requested);
+        if (!granted) { free(access); free(refresh); break; }
+        free(creds->access_token); creds->access_token = access;
+        if (refresh) { free(creds->refresh_token); creds->refresh_token = refresh; }
+        free(creds->scopes); creds->scopes = granted;
+        creds->expires_at = now + expires * 1000;
+        if (refresh_expires > 0 && refresh_expires <= (LLONG_MAX - now) / 1000)
+            creds->refresh_expires_at = now + refresh_expires * 1000;
+        result = oauth_save(creds);
+        if (result == 0) DEBUG("OAuth token refreshed successfully\n");
+        else fprintf(stderr, "Failed to save refreshed Claude credentials.\n");
+        break;
     }
+    curl_slist_free_all(headers); curl_easy_cleanup(curl);
+    free(scopes); free(token); free(client);
+    return result;
+}
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    free(body);
-    free(resp.data);
-
+int auth_recover_unauthorized(auth_t* auth) {
+    if (!auth || auth->type != AUTH_OAUTH) return -1;
+    /* Never rotate an OAuth token without the cross-process lock. */
+    if (claudec_lockfile() != 0) return -1;
+    oauth_creds_t* creds = oauth_load();
+    int result = -1;
+    if (creds) {
+        int needs_refresh = strcmp(creds->access_token, auth->value) == 0 || oauth_needs_refresh(creds->expires_at);
+        if (!needs_refresh || oauth_refresh(creds) == 0) {
+            char* replacement = strdup(creds->access_token);
+            if (replacement) { free(auth->value); auth->value = replacement; result = 0; }
+        }
+    }
+    oauth_creds_free(creds);
+    claudec_unlockfile();
     return result;
 }
 
@@ -474,7 +521,10 @@ int oauth_migrate_from_claude_code(void) {
     oauth_creds_t creds = {0};
     creds.access_token = access_token;
     creds.refresh_token = json_get_string(content, "claudeAiOauth.refreshToken");
-    creds.scopes = json_get_string(content, "claudeAiOauth.scopes");
+    creds.scopes = json_get_scopes(content, "claudeAiOauth.scopes");
+    creds.client_id = json_get_string(content, "claudeAiOauth.clientId");
+    creds.refresh_expires_at = json_get_number(content, "claudeAiOauth.refreshTokenExpiresAt", NULL);
+    creds.expires_at = json_get_number(content, "claudeAiOauth.expiresAt", NULL);
 
     char* expires_str = json_get_string(content, "claudeAiOauth.expiresAt");
     if (expires_str) {
@@ -495,6 +545,7 @@ int oauth_migrate_from_claude_code(void) {
     free(creds.access_token);
     free(creds.refresh_token);
     free(creds.scopes);
+    free(creds.client_id);
 
     return result;
 }
@@ -541,6 +592,10 @@ auth_t auth_load(void) {
      * in that case the re-read hands us the fresh credentials and we skip. */
     if (creds->refresh_token && oauth_needs_refresh(creds->expires_at)) {
         int locked = claudec_lockfile();
+        if (locked != 0) {
+            fprintf(stderr, "Cannot lock Claude credentials for refresh.\n");
+            oauth_creds_free(creds); return auth;
+        }
 
         oauth_creds_free(creds);
         creds = oauth_load();

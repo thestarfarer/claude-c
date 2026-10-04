@@ -205,19 +205,9 @@ int state_save(const state_t* state) {
     int locked = claudec_lockfile();
 
     char* existing = read_file(path);
-    char* oauth_access = NULL;
-    char* oauth_refresh = NULL;
-    char* oauth_scopes = NULL;
-    long long oauth_expires = 0;
-    int found_expires = 0;
-
-    if (existing) {
-        oauth_access = json_get_string(existing, "oauth.accessToken");
-        oauth_refresh = json_get_string(existing, "oauth.refreshToken");
-        oauth_scopes = json_get_string(existing, "oauth.scopes");
-        oauth_expires = json_get_number(existing, "oauth.expiresAt", &found_expires);
-        free(existing);
-    }
+    /* Keep the entire OAuth object, including grant client and refresh expiry. */
+    char* oauth_json = existing ? json_get_raw(existing, "oauth") : NULL;
+    free(existing);
 
     char tmp_path[600];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
@@ -226,9 +216,7 @@ int state_save(const state_t* state) {
     if (!f) {
         if (locked == 0) claudec_unlockfile();
         free(path);
-        free(oauth_access);
-        free(oauth_refresh);
-        free(oauth_scopes);
+        free(oauth_json);
         return -1;
     }
 
@@ -253,23 +241,9 @@ int state_save(const state_t* state) {
         has_prev = 1;
     }
 
-    /* Preserve oauth credentials if they exist */
-    if (oauth_access) {
+    if (oauth_json) {
         if (has_prev) fprintf(f, ",\n");
-        fprintf(f, "  \"oauth\": {\n");
-        fprintf(f, "    \"accessToken\": \"%s\"", oauth_access);
-
-        if (oauth_refresh) {
-            fprintf(f, ",\n    \"refreshToken\": \"%s\"", oauth_refresh);
-        }
-        if (found_expires) {
-            fprintf(f, ",\n    \"expiresAt\": %lld", oauth_expires);
-        }
-        if (oauth_scopes) {
-            fprintf(f, ",\n    \"scopes\": \"%s\"", oauth_scopes);
-        }
-        fprintf(f, "\n  }");
-        has_prev = 1;
+        fprintf(f, "  \"oauth\": %s", oauth_json);
     }
 
     fprintf(f, "\n}\n");
@@ -281,9 +255,7 @@ int state_save(const state_t* state) {
     if (locked == 0) claudec_unlockfile();
     free(path);
 
-    free(oauth_access);
-    free(oauth_refresh);
-    free(oauth_scopes);
+    free(oauth_json);
 
     return rc == 0 ? 0 : -1;
 }

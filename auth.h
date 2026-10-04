@@ -15,8 +15,8 @@
 #define OAUTH_AUTHORIZE_URL "https://claude.com/cai/oauth/authorize"
 #define OAUTH_TOKEN_URL "https://platform.claude.com/v1/oauth/token"
 #define OAUTH_CLIENT_ID "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-#define OAUTH_SCOPES "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
-#define OAUTH_REFRESH_SCOPES "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+#define OAUTH_SCOPES "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
+#define OAUTH_REFRESH_SCOPES "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
 #define OAUTH_REFRESH_BUFFER_MS 300000  /* 5 minutes before expiry */
 
 /* Authentication type */
@@ -32,6 +32,8 @@ typedef struct {
     char* refresh_token;
     long long expires_at;      /* Unix timestamp in milliseconds */
     char* scopes;              /* Space-separated scopes */
+    char* client_id;           /* Client that issued the grant; NULL = official */
+    long long refresh_expires_at; /* Optional refresh-token expiry, milliseconds */
 } oauth_creds_t;
 
 /* Authentication result */
@@ -53,6 +55,9 @@ auth_t auth_load(void);
 
 /* Free authentication resources */
 void auth_free(auth_t* auth);
+
+/* Adopt a sibling's refreshed token or refresh once after HTTP 401. */
+int auth_recover_unauthorized(auth_t* auth);
 
 /* Check if OAuth token needs refresh (expires within buffer time) */
 int oauth_needs_refresh(long long expires_at);

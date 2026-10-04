@@ -16,17 +16,16 @@
 
 /* Billing header constants */
 #define BILLING_SALT "59cf53e54c78"
-#define BILLING_VERSION "2.1.206"
+#define BILLING_VERSION CLAUDE_CODE_VERSION
 
 /* X-Stainless-* telemetry headers sent by the official SDK on /v1/messages.
- * Static values mirror the bundled Anthropic SDK (v0.94.0); OS/Arch are
+ * Static values mirror the bundled Anthropic SDK (v0.112.1); OS/Arch are
  * derived from uname() the way the SDK maps process.platform/process.arch.
  * NOTE: the SDK reports Runtime "node" even under Bun (Bun isn't detected). */
 #define STAINLESS_LANG "js"
-#define STAINLESS_PKG_VERSION "0.94.0"
+#define STAINLESS_PKG_VERSION CLAUDE_CODE_SDK_VERSION
 #define STAINLESS_RUNTIME "node"
 #define STAINLESS_RUNTIME_VERSION "v24.9.0"
-#define STAINLESS_RETRY_COUNT "0"   /* claude-c does not auto-retry */
 #define STAINLESS_TIMEOUT "600"     /* matches the 600s curl timeout below */
 
 /* Map uname sysname -> SDK X-Stainless-OS value */
@@ -52,7 +51,7 @@ static const char* stainless_arch(const char* machine) {
 }
 
 /* Append the SDK's X-Stainless-* telemetry headers (only for /v1/messages) */
-static struct curl_slist* append_stainless_headers(struct curl_slist* headers) {
+static struct curl_slist* append_stainless_headers(struct curl_slist* headers, int retry) {
     struct utsname u;
     const char* os = "Linux";
     const char* arch = "x64";
@@ -65,7 +64,7 @@ static struct curl_slist* append_stainless_headers(struct curl_slist* headers) {
     headers = curl_slist_append(headers, "X-Stainless-Package-Version: " STAINLESS_PKG_VERSION);
     headers = curl_slist_append(headers, "X-Stainless-Runtime: " STAINLESS_RUNTIME);
     headers = curl_slist_append(headers, "X-Stainless-Runtime-Version: " STAINLESS_RUNTIME_VERSION);
-    headers = curl_slist_append(headers, "X-Stainless-Retry-Count: " STAINLESS_RETRY_COUNT);
+    headers = curl_slist_append(headers, retry ? "X-Stainless-Retry-Count: 1" : "X-Stainless-Retry-Count: 0");
     headers = curl_slist_append(headers, "X-Stainless-Timeout: " STAINLESS_TIMEOUT);
     snprintf(buf, sizeof(buf), "X-Stainless-OS: %s", os);
     headers = curl_slist_append(headers, buf);
@@ -79,6 +78,7 @@ typedef struct {
     stream_parser_t parser;
     FILE* output;
     int error;
+    long status;
 } stream_context_t;
 
 /* Context for non-streaming curl callbacks */
@@ -103,6 +103,8 @@ static size_t stream_write_callback(char* ptr, size_t size, size_t nmemb, void* 
     size_t bytes = size * nmemb;
 
     if (!ctx) return 0;
+    /* A 401 body must never reach stdout before credential recovery. */
+    if (ctx->status == 401) return bytes;
 
     int result = stream_parser_feed(&ctx->parser, ptr, bytes, text_callback, ctx);
     if (result != 0) {
@@ -138,9 +140,156 @@ static size_t buffer_write_callback(char* ptr, size_t size, size_t nmemb, void* 
     return bytes;
 }
 
+/* One header builder for both normal and raw requests. */
+static struct curl_slist* message_headers(const auth_t* auth, const state_t* state,
+                                          const char* body, const char* request_id, int retry) {
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "anthropic-version: " API_VERSION);
+    size_t auth_len = strlen(auth->value) + 32;
+    char* credential = malloc(auth_len);
+    if (!credential) { curl_slist_free_all(headers); return NULL; }
+    snprintf(credential, auth_len, auth->type == AUTH_OAUTH ? "Authorization: Bearer %s" : "x-api-key: %s", auth->value);
+    headers = curl_slist_append(headers, credential);
+    free(credential);
+    char beta[512] = "anthropic-beta: ";
+    if (auth->type == AUTH_OAUTH) {
+        headers = append_stainless_headers(headers, retry);
+        headers = curl_slist_append(headers, "User-Agent: " USER_AGENT);
+        headers = curl_slist_append(headers, "x-app: cli");
+        headers = curl_slist_append(headers, "anthropic-dangerous-direct-browser-access: true");
+        char id[256];
+        snprintf(id, sizeof(id), "x-client-request-id: %s", request_id);
+        headers = curl_slist_append(headers, id);
+        if (state->session_id) {
+            snprintf(id, sizeof(id), "X-Claude-Code-Session-Id: %s", state->session_id);
+            headers = curl_slist_append(headers, id);
+        }
+        strcat(beta, OAUTH_BETA);
+        char* model = json_get_string(body, "model");
+        if (!model || !strstr(model, "haiku")) strcat(beta, "," CLAUDE_CODE_BETA);
+        free(model);
+    }
+    char* thinking = json_get_string(body, "thinking.type");
+    char* effort = json_get_string(body, "output_config.effort");
+    char* format = json_get_string(body, "output_config.format.type");
+    const char* extras[3] = {
+        thinking && strcmp(thinking, "disabled") != 0 ? "interleaved-thinking-2025-05-14" : NULL,
+        effort ? "effort-2025-11-24" : NULL,
+        format && strcmp(format, "json_schema") == 0 ? "structured-outputs-2025-12-15" : NULL
+    };
+    for (int i = 0; i < 3; i++) if (extras[i]) {
+        if (beta[strlen(beta) - 1] != ' ') strcat(beta, ",");
+        strcat(beta, extras[i]);
+    }
+    if (beta[strlen(beta) - 1] != ' ') headers = curl_slist_append(headers, beta);
+    free(thinking); free(effort); free(format);
+    return headers;
+}
+
+static size_t stream_header_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    stream_context_t* ctx = userdata;
+    size_t bytes = size * nmemb;
+    char line[128];
+    size_t len = bytes < sizeof(line) - 1 ? bytes : sizeof(line) - 1;
+    memcpy(line, ptr, len); line[len] = 0;
+    long status;
+    if (sscanf(line, "HTTP/%*s %ld", &status) == 1) ctx->status = status;
+    return bytes;
+}
+
+/* Retry only a definitive OAuth 401, never a partial successful response. */
+static CURLcode perform_message(CURL* curl, struct curl_slist** headers, auth_t* auth,
+                                 const state_t* state, const char* body,
+                                 stream_context_t* stream, response_buffer_t* buffer) {
+    char request_id[37];
+    generate_uuid_v4(request_id);
+    curl_easy_setopt(curl, CURLOPT_URL, auth->type == AUTH_OAUTH
+        ? API_BASE_URL API_MESSAGES_PATH "?beta=true" : API_BASE_URL API_MESSAGES_PATH);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
+    if (stream) {
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, stream_header_callback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, stream);
+    }
+    for (int retry = 0; retry < 2; retry++) {
+        curl_slist_free_all(*headers);
+        *headers = message_headers(auth, state, body, request_id, retry);
+        if (!*headers) return CURLE_OUT_OF_MEMORY;
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, *headers);
+        CURLcode result = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        if (result != CURLE_OK || status != 401 || retry || auth_recover_unauthorized(auth) != 0) return result;
+        if (buffer) { buffer->size = 0; buffer->buffer[0] = 0; }
+    }
+    return CURLE_OK;
+}
+
+/* Apply the model-specific parts of Tavern's 2.1.281 request update. Raw
+ * requests retain tool schemas, output format, signatures and explicit effort. */
+static int model_family(const char* model, const char* family) {
+    size_t n = strlen(family);
+    return model && strncmp(model, family, n) == 0 && (model[n] == 0 || model[n] == '-');
+}
+
+static int replace_property(char** body, const char* key, const char* value) {
+    char* next = json_set_property(*body, key, value);
+    if (!next) return -1;
+    free(*body); *body = next; return 0;
+}
+
+static char* prepare_model_request(const char* input) {
+    char* body = strdup(input);
+    char* model = json_get_string(input, "model");
+    char* thinking = json_get_string(input, "thinking.type");
+    int opus5 = model_family(model, "claude-opus-5");
+    int sonnet5 = model_family(model, "claude-sonnet-5");
+    int fable = model_family(model, "claude-fable-5");
+    int mythos = model_family(model, "claude-mythos-5");
+    int opus47 = model_family(model, "claude-opus-4-7");
+    int opus48 = model_family(model, "claude-opus-4-8");
+    int adaptive = opus5 || sonnet5 || fable || mythos || opus47 || opus48
+        || model_family(model, "claude-opus-4-6") || model_family(model, "claude-sonnet-4-6");
+    int required = model_family(model, "claude-opus-5-5") || fable || model_family(model, "claude-mythos-5-1");
+    int xhigh = opus5 || sonnet5 || fable || opus47 || opus48 || model_family(model, "claude-mythos-5-1");
+    if (!body) goto done;
+    if (adaptive && (!thinking || (required && strcmp(thinking, "adaptive") != 0))) {
+        if (replace_property(&body, "thinking", "{\"type\":\"adaptive\",\"display\":\"omitted\"}") != 0) goto fail;
+    }
+    int active = json_string_equals(body, "thinking.type", "adaptive") || json_string_equals(body, "thinking.type", "enabled");
+    if (active || opus5 || sonnet5 || fable || mythos || opus47 || opus48) {
+        if (replace_property(&body, "temperature", NULL) || replace_property(&body, "top_p", NULL)
+            || replace_property(&body, "top_k", NULL)) goto fail;
+    }
+    if (active && (json_string_equals(body, "tool_choice.type", "any") || json_string_equals(body, "tool_choice.type", "tool"))) {
+        if (replace_property(&body, "tool_choice", "{\"type\":\"auto\"}")) goto fail;
+    }
+    if (active || model_family(model, "claude-opus-4-6")) {
+        char* fixed = json_fix_assistant_prefill(body);
+        if (!fixed) goto fail;
+        free(body); body = fixed;
+    }
+    if (!xhigh && json_string_equals(body, "output_config.effort", "xhigh")) {
+        char* config = json_get_raw(body, "output_config");
+        char* adjusted = config ? json_set_property(config, "effort", "\"high\"") : NULL;
+        free(config);
+        if (!adjusted) goto fail;
+        int result = replace_property(&body, "output_config", adjusted);
+        free(adjusted);
+        if (result) goto fail;
+    }
+    goto done;
+fail:
+    free(body); body = NULL;
+done:
+    free(model); free(thinking); return body;
+}
+
 /* Compute billing header string from first user message text.
  * Returns allocated string like:
- *   x-anthropic-billing-header: cc_version=2.1.206.abc; cc_entrypoint=cli; cch=00000;
+ *   x-anthropic-billing-header: cc_version=2.1.281.abc; cc_entrypoint=cli; cch=00000;
  * Caller must free(). Returns NULL on failure.
  */
 static char* compute_billing_header(const char* first_user_text) {
@@ -460,48 +609,6 @@ int api_send_message(const char* model, const char* system_prompt,
         response_buf.size = 0;
     }
 
-    /* Build URL */
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s", API_BASE_URL, API_MESSAGES_PATH);
-
-    /* Build headers */
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    /* Accept: SSE when streaming, JSON otherwise (matches official SDK) */
-    headers = curl_slist_append(headers,
-        stream ? "Accept: text/event-stream" : "Accept: application/json");
-    headers = append_stainless_headers(headers);
-
-    char version_header[64];
-    snprintf(version_header, sizeof(version_header), "anthropic-version: %s", API_VERSION);
-    headers = curl_slist_append(headers, version_header);
-
-    char ua_header[128];
-    snprintf(ua_header, sizeof(ua_header), "User-Agent: %s", USER_AGENT);
-    headers = curl_slist_append(headers, ua_header);
-
-    headers = curl_slist_append(headers, "x-app: cli");
-
-    /* Add session ID header */
-    if (state.session_id) {
-        char session_header[128];
-        snprintf(session_header, sizeof(session_header), "X-Claude-Code-Session-Id: %s", state.session_id);
-        headers = curl_slist_append(headers, session_header);
-    }
-
-    /* Add auth header */
-    char auth_header[512];
-    if (auth.type == AUTH_API_KEY) {
-        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", auth.value);
-        headers = curl_slist_append(headers, auth_header);
-    } else if (auth.type == AUTH_OAUTH) {
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", auth.value);
-        headers = curl_slist_append(headers, auth_header);
-
-        char beta_header[64];
-        snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", MESSAGES_BETA);
-        headers = curl_slist_append(headers, beta_header);
-    }
-
     /* Extract first user message text for billing header */
     char* first_user_text = json_extract_first_user_text(messages_json);
 
@@ -523,11 +630,12 @@ int api_send_message(const char* model, const char* system_prompt,
         goto cleanup;
     }
 
+    char* prepared = prepare_model_request(body);
+    if (!prepared) { fprintf(stderr, "Error: Invalid Claude request body\n"); goto cleanup; }
+    free(body); body = prepared;
     DEBUG("Request body: %s\n", body);
 
     /* Configure curl */
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);  /* 10 minute timeout */
 
@@ -540,7 +648,7 @@ int api_send_message(const char* model, const char* system_prompt,
     }
 
     /* Perform request */
-    CURLcode res = curl_easy_perform(curl);
+    CURLcode res = perform_message(curl, &headers, &auth, &state, body, stream ? &stream_ctx : NULL, stream ? NULL : &response_buf);
 
     if (res != CURLE_OK) {
         fprintf(stderr, "Error: %s\n", curl_easy_strerror(res));
@@ -615,152 +723,45 @@ cleanup:
 
 /* Inject identity string and metadata into request body JSON */
 static char* inject_identity_and_metadata(const char* request_body, const char* metadata_user_id) {
-    /*
-     * We need to:
-     * 1. Find "system" array and prepend identity block, OR add "system" array if missing
-     * 2. Add "metadata" field before the closing }
-     *
-     * Input:  {"model":"...", "system":[...], "messages":[...], ...}
-     * Output: {"model":"...", "system":[{identity}, ...], "messages":[...], ..., "metadata":{...}}
-     */
-
-    size_t request_len = strlen(request_body);
-    const char* identity_block = "{\"type\":\"text\",\"text\":\"" IDENTITY_AGENT "\"}";
-    size_t identity_len = strlen(identity_block);
-
-    /* Compute billing header from first user message */
-    char* first_user_text = json_extract_first_user_text(request_body);
-    char* billing = compute_billing_header(first_user_text);
-    free(first_user_text);
-
-    char billing_block[256] = "";
-    if (billing) {
-        snprintf(billing_block, sizeof(billing_block),
-            "{\"type\":\"text\",\"text\":\"%s\"},", billing);
-        free(billing);
+    char* text = json_extract_first_user_text(request_body);
+    char* billing = compute_billing_header(text);
+    char* system = json_get_raw(request_body, "system");
+    char* system_text = json_get_string(request_body, "system");
+    char* escaped = system_text ? json_escape_string(system_text) : NULL;
+    char* metadata = json_get_raw(request_body, "metadata");
+    char* body = NULL;
+    free(text); free(system_text);
+    if (!billing) goto cleanup;
+    size_t len = strlen(billing) + (system ? strlen(system) : 0)
+        + (escaped ? strlen(escaped) : 0) + 256;
+    char* blocks = malloc(len);
+    if (!blocks) goto cleanup;
+    int n = snprintf(blocks, len, "[{\"type\":\"text\",\"text\":\"%s\"},{\"type\":\"text\",\"text\":\"%s\"}", billing, IDENTITY_AGENT);
+    if (escaped) {
+        snprintf(blocks + n, len - n, ",{\"type\":\"text\",\"text\":\"%s\"}]", escaped);
+    } else if (system && *system == '[') {
+        const char* start = system + 1;
+        while (*start == ' ' || *start == '\n' || *start == '\r' || *start == '\t') start++;
+        snprintf(blocks + n, len - n, "%s%s", *start == ']' ? "" : ",", start);
+    } else if (!system) {
+        strcpy(blocks + n, "]");
+    } else { free(blocks); goto cleanup; }
+    body = json_set_property(request_body, "system", blocks);
+    free(blocks);
+    if (body) {
+        /* state_build_metadata returns a JSON-escaped string, ready to quote. */
+        size_t size = (metadata_user_id ? strlen(metadata_user_id) : 8) + 3;
+        char* user = malloc(size);
+        if (!user) { free(body); body = NULL; goto cleanup; }
+        snprintf(user, size, "\"%s\"", metadata_user_id ? metadata_user_id : "claude-c");
+        char* merged = json_set_property(metadata ? metadata : "{}", "user_id", user);
+        free(user);
+        if (!merged || replace_property(&body, "metadata", merged)) { free(body); body = NULL; }
+        free(merged);
     }
-    size_t billing_len = strlen(billing_block);
-
-    /* Calculate size for metadata */
-    char metadata_json[512];
-    snprintf(metadata_json, sizeof(metadata_json),
-        "\"metadata\":{\"user_id\":\"%s\"}",
-        metadata_user_id ? metadata_user_id : "claude-c");
-    size_t metadata_len = strlen(metadata_json);
-
-    /* Allocate generous buffer */
-    size_t buf_size = request_len + billing_len + identity_len + metadata_len + 256;
-    char* result = malloc(buf_size);
-    if (!result) return NULL;
-
-    /* Find "system": in the request */
-    const char* system_pos = strstr(request_body, "\"system\"");
-    const char* system_array_start = NULL;
-
-    if (system_pos) {
-        /* Find the [ after "system": */
-        const char* p = system_pos + 8; /* skip "system" */
-        while (*p && (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')) p++;
-        if (*p == '[') {
-            system_array_start = p;
-        }
-    }
-
-    char* out = result;
-
-    if (system_array_start) {
-        /* Copy up to and including [ */
-        size_t prefix_len = system_array_start - request_body + 1;
-        memcpy(out, request_body, prefix_len);
-        out += prefix_len;
-
-        /* Insert billing block (before identity) */
-        if (billing_len > 0) {
-            memcpy(out, billing_block, billing_len);
-            out += billing_len;
-        }
-
-        /* Insert identity block */
-        memcpy(out, identity_block, identity_len);
-        out += identity_len;
-
-        /* Check if system array is empty or has content */
-        const char* after_bracket = system_array_start + 1;
-        while (*after_bracket && (*after_bracket == ' ' || *after_bracket == '\t' || *after_bracket == '\n')) {
-            after_bracket++;
-        }
-        if (*after_bracket && *after_bracket != ']') {
-            /* Non-empty array, add comma */
-            *out++ = ',';
-        }
-
-        /* Copy the rest until the final } */
-        const char* rest = system_array_start + 1;
-        /* Find the final } of the JSON object */
-        const char* final_brace = request_body + request_len - 1;
-        while (final_brace > rest && *final_brace != '}') final_brace--;
-
-        if (final_brace > rest) {
-            size_t rest_len = final_brace - rest;
-            memcpy(out, rest, rest_len);
-            out += rest_len;
-
-            /* Add metadata */
-            *out++ = ',';
-            memcpy(out, metadata_json, metadata_len);
-            out += metadata_len;
-
-            /* Close with } */
-            *out++ = '}';
-            *out = '\0';
-        } else {
-            /* Malformed JSON, just copy rest */
-            strcpy(out, rest);
-        }
-    } else {
-        /* No "system" field found, need to add it after the opening { */
-        const char* open_brace = strchr(request_body, '{');
-        if (!open_brace) {
-            free(result);
-            return NULL;
-        }
-
-        /* Copy { */
-        *out++ = '{';
-
-        /* Add system array with billing + identity */
-        out += sprintf(out, "\"system\":[%s%s],", billing_block, identity_block);
-
-        /* Copy rest of original content (skip the {) */
-        const char* content_start = open_brace + 1;
-        while (*content_start && (*content_start == ' ' || *content_start == '\t' || *content_start == '\n')) {
-            content_start++;
-        }
-
-        /* Find final } */
-        const char* final_brace = request_body + request_len - 1;
-        while (final_brace > content_start && *final_brace != '}') final_brace--;
-
-        if (final_brace > content_start) {
-            size_t content_len = final_brace - content_start;
-            memcpy(out, content_start, content_len);
-            out += content_len;
-
-            /* Add metadata */
-            *out++ = ',';
-            memcpy(out, metadata_json, metadata_len);
-            out += metadata_len;
-
-            /* Close with } */
-            *out++ = '}';
-            *out = '\0';
-        } else {
-            free(result);
-            return NULL;
-        }
-    }
-
-    return result;
+cleanup:
+    free(billing); free(system); free(escaped); free(metadata);
+    return body;
 }
 
 int api_send_raw_request(const char* request_body, int json_output, int cache, FILE* output) {
@@ -801,6 +802,8 @@ int api_send_raw_request(const char* request_body, int json_output, int cache, F
         return 1;
     }
 
+    if (replace_property(&body, "stream", "false")) goto cleanup;
+
     /* Optional prompt caching: mark the last message and last system block of
        the injected body (see build_request_body for the caching model). Each
        helper returns a new copy or NULL (keep previous) on parse failure. */
@@ -811,6 +814,9 @@ int api_send_raw_request(const char* request_body, int json_output, int cache, F
         if (cs) { free(body); body = cs; }
     }
 
+    char* prepared = prepare_model_request(body);
+    if (!prepared) { fprintf(stderr, "Error: Invalid Claude request body\n"); goto cleanup; }
+    free(body); body = prepared;
     DEBUG("Request body: %s\n", body);
 
     /* Initialize curl */
@@ -839,57 +845,14 @@ int api_send_raw_request(const char* request_body, int json_output, int cache, F
     response_buf.buffer[0] = '\0';
     response_buf.size = 0;
 
-    /* Build URL */
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s", API_BASE_URL, API_MESSAGES_PATH);
-
-    /* Build headers */
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    /* Raw request mode is always non-streaming */
-    headers = curl_slist_append(headers, "Accept: application/json");
-    headers = append_stainless_headers(headers);
-
-    char version_header[64];
-    snprintf(version_header, sizeof(version_header), "anthropic-version: %s", API_VERSION);
-    headers = curl_slist_append(headers, version_header);
-
-    char ua_header[128];
-    snprintf(ua_header, sizeof(ua_header), "User-Agent: %s", USER_AGENT);
-    headers = curl_slist_append(headers, ua_header);
-
-    headers = curl_slist_append(headers, "x-app: cli");
-
-    /* Add session ID header */
-    if (state.session_id) {
-        char session_header[128];
-        snprintf(session_header, sizeof(session_header), "X-Claude-Code-Session-Id: %s", state.session_id);
-        headers = curl_slist_append(headers, session_header);
-    }
-
-    /* Add auth header */
-    char auth_header[512];
-    if (auth.type == AUTH_API_KEY) {
-        snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", auth.value);
-        headers = curl_slist_append(headers, auth_header);
-    } else if (auth.type == AUTH_OAUTH) {
-        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", auth.value);
-        headers = curl_slist_append(headers, auth_header);
-
-        char beta_header[64];
-        snprintf(beta_header, sizeof(beta_header), "anthropic-beta: %s", MESSAGES_BETA);
-        headers = curl_slist_append(headers, beta_header);
-    }
-
     /* Configure curl */
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);  /* 10 minute timeout */
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, buffer_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_buf);
 
     /* Perform request */
-    CURLcode res = curl_easy_perform(curl);
+    CURLcode res = perform_message(curl, &headers, &auth, &state, body, NULL, &response_buf);
 
     if (res != CURLE_OK) {
         fprintf(stderr, "Error: %s\n", curl_easy_strerror(res));

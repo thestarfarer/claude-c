@@ -17,9 +17,10 @@ extern int verbose;
 #define API_VERSION "2023-06-01"
 #define OAUTH_BETA "oauth-2025-04-20"
 #define CLAUDE_CODE_BETA "claude-code-20250219"
-/* Beta header sent on /v1/messages OAuth requests (matches official CLI) */
-#define MESSAGES_BETA OAUTH_BETA "," CLAUDE_CODE_BETA
-#define USER_AGENT "claude-cli/2.1.206 (external, cli)"
+/* Messages OAuth betas are selected per model; Haiku omits CLAUDE_CODE_BETA. */
+#define CLAUDE_CODE_VERSION "2.1.281"
+#define CLAUDE_CODE_SDK_VERSION "0.112.1"
+#define USER_AGENT "claude-cli/" CLAUDE_CODE_VERSION " (external, cli)"
 
 /* Identity strings - must match server whitelist exactly */
 #define IDENTITY_AGENT "You are a Claude agent, built on Anthropic's Claude Agent SDK."

@@ -52,4 +52,17 @@ char* json_add_cache_control_last_message(const char* messages_json);
  */
 char* json_add_cache_control_last_system_block(const char* body);
 
+/* Copy a JSON value by key path without decoding its contents. */
+char* json_get_raw(const char* json, const char* key);
+
+/* Replace/add a top-level property, or remove it when value is NULL.
+ * Value is already serialized JSON. Unrelated values remain verbatim. */
+char* json_set_property(const char* json, const char* key, const char* value);
+
+/* Convert a trailing assistant prefill to a user message for thinking models. */
+char* json_fix_assistant_prefill(const char* json);
+
+/* OAuth scopes may be stored as a string or an array of strings. */
+char* json_get_scopes(const char* json, const char* key);
+
 #endif /* JSON_H */

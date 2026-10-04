@@ -2,7 +2,7 @@
  * state.h - Persistent state and metadata for Claude C client
  *
  * Mimics the real Claude Code CLI metadata format:
- *   user_{userID}_account_{accountUuid}_session_{sessionId}
+ *   {"device_id":"...","account_uuid":"...","session_id":"..."}
  */
 
 #ifndef STATE_H

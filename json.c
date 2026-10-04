@@ -516,3 +516,105 @@ char* json_add_cache_control_last_system_block(const char* body) {
     out[in_len + cclen] = '\0';
     return out;
 }
+
+char* json_get_raw(const char* json, const char* key) {
+    if (!json || !key) return NULL;
+    char* keys = strdup(key);
+    if (!keys) return NULL;
+    const char* p = json;
+    char* save = NULL;
+    for (char* part = strtok_r(keys, ".", &save); part && p;
+         part = strtok_r(NULL, ".", &save)) p = find_key(p, part);
+    free(keys);
+    if (!p) return NULL;
+    return strndup(p, (size_t)(skip_value(p) - p));
+}
+
+char* json_set_property(const char* json, const char* key, const char* value) {
+    if (!json || !key) return NULL;
+    const char* p = skip_ws(json);
+    if (*p++ != '{') return NULL;
+    char* escaped = json_escape_string(key);
+    if (!escaped) return NULL;
+    size_t size = strlen(json) + strlen(escaped) + (value ? strlen(value) : 0) + 8;
+    char* result = malloc(size);
+    if (!result) { free(escaped); return NULL; }
+    char* out = result;
+    *out++ = '{';
+    int count = 0;
+    while (*(p = skip_ws(p)) && *p != '}') {
+        if (*p != '"') goto fail;
+        const char* start = p;
+        char* name = parse_string(p);
+        if (!name) goto fail;
+        p = skip_ws(skip_value(p));
+        if (*p++ != ':') { free(name); goto fail; }
+        const char* end = skip_value(p);
+        if (end == p) { free(name); goto fail; }
+        if (strcmp(name, key) != 0) {
+            if (count++) *out++ = ',';
+            memcpy(out, start, (size_t)(end - start));
+            out += end - start;
+        }
+        free(name);
+        p = skip_ws(end);
+        if (*p == ',') p++;
+        else if (*p != '}') goto fail;
+    }
+    if (*p != '}' || *skip_ws(p + 1)) goto fail;
+    if (value) {
+        if (count) *out++ = ',';
+        out += sprintf(out, "\"%s\":%s", escaped, value);
+    }
+    *out++ = '}'; *out = 0;
+    free(escaped);
+    return result;
+fail:
+    free(escaped); free(result); return NULL;
+}
+
+char* json_get_scopes(const char* json, const char* key) {
+    char* raw = json_get_raw(json, key);
+    if (!raw) return NULL;
+    if (*raw == '"') { char* value = parse_string(raw); free(raw); return value; }
+    if (*raw != '[') { free(raw); return NULL; }
+    char* result = calloc(strlen(raw) + 1, 1);
+    if (!result) { free(raw); return NULL; }
+    const char* p = raw + 1;
+    while (*(p = skip_ws(p)) && *p != ']') {
+        char* scope = parse_string(p);
+        if (!scope) { free(result); free(raw); return NULL; }
+        if (*result) strcat(result, " ");
+        strcat(result, scope); free(scope);
+        p = skip_ws(skip_value(p));
+        if (*p == ',') p++;
+        else if (*p != ']') { free(result); free(raw); return NULL; }
+    }
+    free(raw);
+    return result;
+}
+
+char* json_fix_assistant_prefill(const char* json) {
+    const char* array = find_key(json, "messages");
+    if (!array || *array != '[') return strdup(json);
+    const char* p = array + 1;
+    const char* last = NULL;
+    const char* end = NULL;
+    while (*(p = skip_ws(p)) && *p != ']') {
+        last = p; end = skip_value(p);
+        if (end == p) return NULL;
+        p = skip_ws(end);
+        if (*p == ',') p++;
+        else if (*p != ']') return NULL;
+    }
+    if (!last || !json_string_equals(last, "role", "assistant")) return strdup(json);
+    const char* role = find_key(last, "role");
+    const char* after = skip_value(role);
+    char* result = malloc(strlen(json) + 1);
+    if (!result) return NULL;
+    size_t prefix = (size_t)(role - json);
+    memcpy(result, json, prefix);
+    strcpy(result + prefix, "\"user\"");
+    strcpy(result + prefix + 6, after);
+    return result;
+}

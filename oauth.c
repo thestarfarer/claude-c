@@ -151,25 +151,32 @@ char* oauth_build_auth_url(const pkce_t* pkce, int port) {
     if (!pkce) return NULL;
 
     /* URL-encode components are safe (base64url has no special chars) */
+    CURL* curl = curl_easy_init();
+    if (!curl) return NULL;
+    char* scopes = curl_easy_escape(curl, OAUTH_SCOPES, 0);
+    if (!scopes) { curl_easy_cleanup(curl); return NULL; }
     size_t url_len = 1024 + strlen(pkce->code_challenge) + strlen(pkce->state);
     char* url = malloc(url_len);
-    if (!url) return NULL;
+    if (!url) { curl_free(scopes); curl_easy_cleanup(curl); return NULL; }
 
     snprintf(url, url_len,
         "%s?code=true"
         "&client_id=%s"
         "&response_type=code"
         "&redirect_uri=http://localhost:%d/callback"
-        "&scope=org:create_api_key%%20user:profile%%20user:inference%%20user:sessions:claude_code%%20user:mcp_servers%%20user:file_upload"
+        "&scope=%s"
         "&code_challenge=%s"
         "&code_challenge_method=S256"
         "&state=%s",
         OAUTH_AUTHORIZE_URL,
         OAUTH_CLIENT_ID,
         port,
+        scopes,
         pkce->code_challenge,
         pkce->state);
 
+    curl_free(scopes);
+    curl_easy_cleanup(curl);
     return url;
 }
 
@@ -364,13 +371,16 @@ int oauth_exchange_code(const char* code, const pkce_t* pkce, int port) {
                 oauth_creds_t creds = {0};
                 creds.access_token = access_token;
                 creds.refresh_token = refresh_token;
-                creds.scopes = scope;
+                creds.scopes = scope ? scope : OAUTH_SCOPES;
+                long long refresh_expires = json_get_number(resp.data, "refresh_token_expires_in", NULL);
 
                 if (found_expires && expires_in > 0) {
                     /* Get current time in milliseconds */
                     struct timeval tv;
                     gettimeofday(&tv, NULL);
-                    creds.expires_at = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000 + (expires_in * 1000);
+                    long long now = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+                    creds.expires_at = now + expires_in * 1000;
+                    if (refresh_expires > 0) creds.refresh_expires_at = now + refresh_expires * 1000;
                 }
 
                 result = oauth_save(&creds);
@@ -378,10 +388,7 @@ int oauth_exchange_code(const char* code, const pkce_t* pkce, int port) {
                     fprintf(stderr, "Authentication successful!\n");
                 }
 
-                /* Don't free - oauth_save doesn't copy */
-                access_token = NULL;
-                refresh_token = NULL;
-                scope = NULL;
+                /* oauth_save serializes synchronously; free the response strings below. */
             } else {
                 fprintf(stderr, "Token response missing required fields\n");
             }

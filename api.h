@@ -11,8 +11,18 @@
 extern int verbose;
 #define DEBUG(...) do { if (verbose) fprintf(stderr, __VA_ARGS__); } while(0)
 
-/* API configuration */
+/* Rate-limit report flag - set via --ratelimit. When set, the RATELIMIT line
+ * is printed to stderr on success too (it is always printed on API errors). */
+extern int report_ratelimit;
+
+/* Exit status for an HTTP 429. Whether it is a hard quota cap or a transient
+ * limit is in the RATELIMIT line (status=rejected + the binding claim). */
+#define EXIT_RATE_LIMITED 3
+
+/* API configuration (base URL overridable at build time for test stubs) */
+#ifndef API_BASE_URL
 #define API_BASE_URL "https://api.anthropic.com"
+#endif
 #define API_MESSAGES_PATH "/v1/messages"
 #define API_VERSION "2023-06-01"
 #define OAUTH_BETA "oauth-2025-04-20"
@@ -39,7 +49,7 @@ extern int verbose;
  * - cache: If non-zero, add prompt-cache breakpoints (append-only convos)
  * - output: Stream text output to this file (usually stdout)
  *
- * Returns 0 on success, non-zero on error
+ * Returns 0 on success, EXIT_RATE_LIMITED on HTTP 429, 1 on other errors
  */
 int api_send_message(
     const char* model,
@@ -60,7 +70,7 @@ int api_send_message(
  *          and last message of the (post-injection) body
  * - output: Output to this file (usually stdout)
  *
- * Returns 0 on success, non-zero on error
+ * Returns 0 on success, EXIT_RATE_LIMITED on HTTP 429, 1 on other errors
  */
 int api_send_raw_request(
     const char* request_body,

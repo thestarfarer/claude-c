@@ -11,6 +11,7 @@
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <sys/utsname.h>
 
@@ -188,31 +189,107 @@ static struct curl_slist* message_headers(const auth_t* auth, const state_t* sta
     return headers;
 }
 
-static size_t stream_header_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    stream_context_t* ctx = userdata;
+/* Rate-limit headers of the final response: anthropic-ratelimit-unified-*
+ * (prefix stripped, e.g. "7d_oi-utilization") plus retry-after, in arrival
+ * order. Bucket names are passed through uninterpreted. */
+#define RL_PREFIX "anthropic-ratelimit-unified-"
+#define RL_MAX 32
+typedef struct {
+    int count;
+    char key[RL_MAX][64];
+    char value[RL_MAX][96];
+} ratelimit_info_t;
+
+typedef struct {
+    stream_context_t* stream;   /* NULL in non-streaming mode */
+    ratelimit_info_t* rl;
+} header_context_t;
+
+/* Copy at most cap-1 chars of src[0..len), dropping CR/LF and turning spaces
+ * into '_' so the RATELIMIT line stays one space-separated record. */
+static void rl_copy(char* dst, size_t cap, const char* src, size_t len) {
+    size_t n = 0;
+    for (size_t i = 0; i < len && n + 1 < cap; i++) {
+        char c = src[i];
+        if (c == '\r' || c == '\n') continue;
+        dst[n++] = (c == ' ' || c == '\t') ? '_' : c;
+    }
+    dst[n] = 0;
+}
+
+static void rl_collect(ratelimit_info_t* rl, const char* line, size_t len) {
+    const char* key;
+    size_t prefix;
+    if (len > strlen(RL_PREFIX) && strncasecmp(line, RL_PREFIX, strlen(RL_PREFIX)) == 0) {
+        prefix = strlen(RL_PREFIX);
+    } else if (len > 12 && strncasecmp(line, "retry-after:", 12) == 0) {
+        prefix = 0;
+    } else {
+        return;
+    }
+    if (rl->count >= RL_MAX) return;
+    const char* colon = memchr(line, ':', len);
+    if (!colon) return;
+    key = line + prefix;
+    const char* val = colon + 1;
+    while (val < line + len && (*val == ' ' || *val == '\t')) val++;
+    rl_copy(rl->key[rl->count], sizeof(rl->key[0]), key, (size_t)(colon - key));
+    rl_copy(rl->value[rl->count], sizeof(rl->value[0]), val, (size_t)(line + len - val));
+    rl->count++;
+}
+
+static size_t header_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    header_context_t* ctx = userdata;
     size_t bytes = size * nmemb;
     char line[128];
     size_t len = bytes < sizeof(line) - 1 ? bytes : sizeof(line) - 1;
     memcpy(line, ptr, len); line[len] = 0;
     long status;
-    if (sscanf(line, "HTTP/%*s %ld", &status) == 1) ctx->status = status;
+    if (sscanf(line, "HTTP/%*s %ld", &status) == 1) {
+        if (ctx->stream) ctx->stream->status = status;
+        /* New response (e.g. after a 401 retry): report only the final one. */
+        if (ctx->rl) ctx->rl->count = 0;
+    } else if (ctx->rl) {
+        rl_collect(ctx->rl, ptr, bytes);
+    }
     return bytes;
+}
+
+/* One line on stderr: RATELIMIT http=429 [error_type=...] key=value ... */
+static void rl_report(const ratelimit_info_t* rl, long http_code, const char* error_type) {
+    fprintf(stderr, "RATELIMIT http=%ld", http_code);
+    if (error_type) fprintf(stderr, " error_type=%s", error_type);
+    for (int i = 0; i < rl->count; i++)
+        fprintf(stderr, " %s=%s", rl->key[i], rl->value[i]);
+    fputc('\n', stderr);
+}
+
+/* Report the response's rate-limit state: always on errors that carry
+ * headers or are a 429, on success only with --ratelimit/--verbose.
+ * Returns the exit status for a non-200 response. */
+static int rl_finish(const ratelimit_info_t* rl, long http_code, const char* error_type) {
+    if (http_code == 200) {
+        if ((report_ratelimit || verbose) && rl->count > 0) rl_report(rl, http_code, NULL);
+        return 0;
+    }
+    if (rl->count > 0 || http_code == 429) rl_report(rl, http_code, error_type);
+    return http_code == 429 ? EXIT_RATE_LIMITED : 1;
 }
 
 /* Retry only a definitive OAuth 401, never a partial successful response. */
 static CURLcode perform_message(CURL* curl, struct curl_slist** headers, auth_t* auth,
                                  const state_t* state, const char* body,
-                                 stream_context_t* stream, response_buffer_t* buffer) {
+                                 stream_context_t* stream, response_buffer_t* buffer,
+                                 ratelimit_info_t* rl) {
     char request_id[37];
     generate_uuid_v4(request_id);
+    header_context_t hctx = { stream, rl };
     curl_easy_setopt(curl, CURLOPT_URL, auth->type == AUTH_OAUTH
         ? API_BASE_URL API_MESSAGES_PATH "?beta=true" : API_BASE_URL API_MESSAGES_PATH);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
-    if (stream) {
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, stream_header_callback);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, stream);
-    }
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hctx);
     for (int retry = 0; retry < 2; retry++) {
         curl_slist_free_all(*headers);
         *headers = message_headers(auth, state, body, request_id, retry);
@@ -555,6 +632,7 @@ int api_send_message(const char* model, const char* system_prompt,
     char* metadata_user_id = NULL;
     stream_context_t stream_ctx = {0};
     response_buffer_t response_buf = {0};
+    ratelimit_info_t rl = {0};
     state_t state = {0};
 
     /* Load authentication */
@@ -648,7 +726,7 @@ int api_send_message(const char* model, const char* system_prompt,
     }
 
     /* Perform request */
-    CURLcode res = perform_message(curl, &headers, &auth, &state, body, stream ? &stream_ctx : NULL, stream ? NULL : &response_buf);
+    CURLcode res = perform_message(curl, &headers, &auth, &state, body, stream ? &stream_ctx : NULL, stream ? NULL : &response_buf, &rl);
 
     if (res != CURLE_OK) {
         fprintf(stderr, "Error: %s\n", curl_easy_strerror(res));
@@ -677,8 +755,13 @@ int api_send_message(const char* model, const char* system_prompt,
                 fprintf(stderr, "API Error: HTTP %ld\n", http_code);
             }
         }
+        /* error.type is only recoverable from the buffered (non-stream) body. */
+        char* err_type = stream ? NULL : json_get_string(response_buf.buffer, "error.type");
+        result = rl_finish(&rl, http_code, err_type);
+        free(err_type);
         goto cleanup;
     }
+    rl_finish(&rl, http_code, NULL);
 
     /* Process response */
     if (stream) {
@@ -771,6 +854,7 @@ int api_send_raw_request(const char* request_body, int json_output, int cache, F
     char* body = NULL;
     char* metadata_user_id = NULL;
     response_buffer_t response_buf = {0};
+    ratelimit_info_t rl = {0};
     state_t state = {0};
 
     /* Load authentication */
@@ -852,7 +936,7 @@ int api_send_raw_request(const char* request_body, int json_output, int cache, F
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_buf);
 
     /* Perform request */
-    CURLcode res = perform_message(curl, &headers, &auth, &state, body, NULL, &response_buf);
+    CURLcode res = perform_message(curl, &headers, &auth, &state, body, NULL, &response_buf, &rl);
 
     if (res != CURLE_OK) {
         fprintf(stderr, "Error: %s\n", curl_easy_strerror(res));
@@ -872,8 +956,12 @@ int api_send_raw_request(const char* request_body, int json_output, int cache, F
         } else {
             fprintf(stderr, "API Error: HTTP %ld\n", http_code);
         }
+        char* err_type = json_get_string(response_buf.buffer, "error.type");
+        result = rl_finish(&rl, http_code, err_type);
+        free(err_type);
         goto cleanup;
     }
+    rl_finish(&rl, http_code, NULL);
 
     /* Process response */
     if (json_output) {

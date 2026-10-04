@@ -22,6 +22,9 @@
 /* Global verbose flag */
 int verbose = 0;
 
+/* Global --ratelimit flag (see api.h) */
+int report_ratelimit = 0;
+
 static struct option long_options[] = {
     {"print",         no_argument,       0, 'p'},
     {"stream",        no_argument,       0, 'S'},
@@ -34,6 +37,7 @@ static struct option long_options[] = {
     {"json-output",   no_argument,       0, 'J'},
     {"login",         no_argument,       0, 'L'},
     {"cache",         no_argument,       0, 2},
+    {"ratelimit",     no_argument,       0, 3},
     {"verbose",       no_argument,       0, 1},
     {"help",          no_argument,       0, 'h'},
     {"version",       no_argument,       0, 'v'},
@@ -58,6 +62,7 @@ static void print_usage(const char* prog) {
         "  -J, --json-output        Output raw API response JSON\n"
         "  -L, --login              Authenticate with Claude (OAuth)\n"
         "      --cache              Add prompt-cache breakpoints (append-only convos)\n"
+        "      --ratelimit          Print the RATELIMIT line to stderr on success too\n"
         "      --verbose            Verbose output (show debug info)\n"
         "  -h, --help               Show this help\n"
         "  -v, --version            Show version\n"
@@ -333,6 +338,9 @@ int main(int argc, char** argv) {
                 }
             case 2:  /* --cache (no short option) */
                 cache = 1;
+                break;
+            case 3:  /* --ratelimit (no short option) */
+                report_ratelimit = 1;
                 break;
             case 1:  /* --verbose (no short option) */
                 verbose = 1;

@@ -86,6 +86,7 @@ echo "What is 2+2?" | ./claude-c -p -s "Be concise, reply with just the answer"
 | `-J, --json-output` | Output raw API response JSON |
 | `-L, --login` | Authenticate with Claude (OAuth) |
 | `--cache` | Add prompt-cache breakpoints (append-only conversations) |
+| `--ratelimit` | Print the `RATELIMIT` line to stderr on success too (see Rate Limits) |
 | `--verbose` | Verbose output (show debug info) |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
@@ -117,6 +118,46 @@ Notes:
 - Also works in raw request mode (`-r`): the last system block and last message
   of your body are marked automatically. If your body already sets its own
   `cache_control`, omit `--cache` to avoid duplicate markers.
+
+## Rate Limits
+
+Every API response carries `anthropic-ratelimit-unified-*` headers describing
+subscription quota. claude-c reports them on stderr as one machine-parseable
+line — prefix stripped, keys and values passed through verbatim in arrival
+order, plus `retry-after` when present:
+
+```
+RATELIMIT http=429 error_type=rate_limit_error retry-after=3600 status=rejected representative-claim=seven_day_oi reset=1791745200 7d_oi-status=rejected 7d_oi-utilization=1.0
+```
+
+- **On errors** the line is always printed, right after the unchanged
+  `API Error (...)` line (when the response carried such headers, or is a 429).
+  `error_type` is the body's `error.type`; it is omitted in `--stream` mode.
+- **On success** it is printed only with `--ratelimit` (or `--verbose`), so
+  callers can watch utilization and switch models *before* hitting a cap.
+  stdout and `--json-output` are never touched.
+- **Exit status 3** on any HTTP 429; other failures stay 1. Whether a 429 is a
+  hard quota cap or a transient limit is in the line: `status=rejected` plus the
+  binding `representative-claim`, and the per-bucket `*-status`.
+
+Headers observed on OAuth (subscription) responses:
+
+| Key | Meaning |
+|-----|---------|
+| `status` | Overall verdict: `allowed` / `rejected` |
+| `representative-claim` | The bucket currently binding, e.g. `five_hour` |
+| `reset` | Unix time the binding bucket resets |
+| `5h-*`, `7d-*` | Per-bucket `status`, `utilization` (0.0–1.0), `reset` |
+| `7d_oi-*` | Same, a separate weekly bucket seen only on some models (e.g. Fable) |
+| `overage-status`, `overage-disabled-reason` | Pay-as-you-go spillover; `rejected` = a cap is a hard stop |
+| `fallback-percentage` | Server-reported fallback share |
+
+Bucket names are reported as the server sends them and are not interpreted, so
+new buckets appear without a claude-c change.
+
+```bash
+./claude-c -p -r @request.json -J --ratelimit 2>limits.txt
+```
 
 ## Raw Request Mode
 
